@@ -211,7 +211,38 @@ app.post("/api/pet/do/test-all", requireAuth, async (req, res) => {
   }
 });
 
+// Test une sélection de relais DO0..DO7 (1s chacun) en séquence
+// body: { channels: [0,1,3], ms: 1000, delay: 1200 }
+app.post("/api/pet/do/test-selected", requireAuth, async (req, res) => {
+  try {
+    const ms = clampMs(req.body?.ms ?? PULSE_MS_DEFAULT);
+    const delay = Math.min(5000, Math.max(200, Number(req.body?.delay ?? TEST_DELAY_DEFAULT)));
+
+    const channels = Array.isArray(req.body?.channels) ? req.body.channels : [];
+    const clean = [...new Set(channels.map(Number))]
+      .filter(n => Number.isInteger(n) && n >= 0 && n <= 7);
+
+    if (clean.length === 0) {
+      return res.status(400).json({ ok: false, error: "Aucun relais sélectionné" });
+    }
+
+    (async () => {
+      for (const ch of clean) {
+        try { await petPulseCoil(ch, ms); }
+        catch (e) { console.error(`Test DO${ch} failed:`, e?.message || e); }
+
+        await new Promise(r => setTimeout(r, delay));
+      }
+    })();
+
+    return res.json({ ok: true, action: "test_selected", channels: clean, ms, delay });
+  } catch (e) {
+    console.error("/api/pet/do/test-selected:", e?.message || e);
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`🚀 adjudicator.js lancé sur le port ${PORT}`);
-  console.log(`➡️ PET: ${PET_IP}:${PET_PORT} (unit ${PET_UNIT})`);
+  console.log(`adjudicator.js lancé sur le port ${PORT}`);
+  console.log(`PET: ${PET_IP}:${PET_PORT} (unit ${PET_UNIT})`);
 });
