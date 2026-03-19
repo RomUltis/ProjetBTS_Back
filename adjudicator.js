@@ -48,13 +48,14 @@ const ZONES = {
 };
 
 // Entrées DI — PET-7050
+// Tous inversés : la PET-7050 renvoie HIGH = repos/fermé, LOW = alerte/ouvert
 const DI_MAP = [
-  { ch: 4, zone: "ciel1", label: "Détecteur mouvement CIEL 1", type: "mouvement" },
-  { ch: 5, zone: "ciel1,ciel2", label: "Porte transition CIEL 1-2 / fenêtre", type: "porte" },
-  { ch: 6, zone: "ciel2", label: "Détecteur mouvement CIEL 2", type: "mouvement" },
-  { ch: 7, zone: "ciel2", label: "Porte CIEL 2 + fenêtre", type: "porte" },
-  { ch: 8, zone: "physique", label: "Détecteur mouvement Physique", type: "mouvement" },
-  { ch: 9, zone: "physique", label: "Portes Physique + fenêtre + bureau", type: "porte" },
+  { ch: 4, zone: "ciel1", label: "Détecteur mouvement CIEL 1", type: "mouvement", inverted: true },
+  { ch: 5, zone: "ciel1,ciel2", label: "Porte transition CIEL 1-2 / fenêtre", type: "porte", inverted: true },
+  { ch: 6, zone: "ciel2", label: "Détecteur mouvement CIEL 2", type: "mouvement", inverted: true },
+  { ch: 7, zone: "ciel2", label: "Porte CIEL 2 + fenêtre", type: "porte", inverted: true },
+  { ch: 8, zone: "physique", label: "Détecteur mouvement Physique", type: "mouvement", inverted: true },
+  { ch: 9, zone: "physique", label: "Portes Physique + fenêtre + bureau", type: "porte", inverted: true },
 ];
 
 // Sorties DO — PET-7067
@@ -64,7 +65,7 @@ const DO_MAP = [
   { ch: 2, zone: "ciel1", role: "sirene", label: "Sirène" },
   { ch: 3, zone: "ciel2", role: "flash", label: "Flash" },
   { ch: 4, zone: "ciel2", role: "sirene", label: "Sirène" },
-  { ch: 5, zone: "physique", role: "flash", label: "Flash" },
+  { ch: 7, zone: "physique", role: "flash", label: "Flash" },
   { ch: 6, zone: "physique", role: "sirene", label: "Sirène" },
 ];
 
@@ -331,23 +332,26 @@ async function pollDI() {
     const config = await loadAlarmConfig();
 
     for (const di of DI_MAP) {
-      const val = !!bits[di.ch];
+      const rawVal = !!bits[di.ch];
+      // Pour les contacts NF (portes/fenêtres) : HIGH = fermé = OK → on inverse
+      // triggered = true signifie "en alerte" (porte ouverte ou mouvement détecté)
+      const triggered = di.inverted ? !rawVal : rawVal;
       const prev = lastDIState[di.ch];
-      currentDIState[di.ch] = val;
+      currentDIState[di.ch] = triggered;
 
       // Changement détecté
-      if (prev !== undefined && prev !== val) {
-        console.log(`DI${di.ch} changé: ${prev} → ${val} (${di.label})`);
-        const willTrigger = config.armed && val && !alarmTriggered;
-        await logDIEvent(di.ch, val, willTrigger);
+      if (prev !== undefined && prev !== triggered) {
+        console.log(`DI${di.ch} changé: ${prev} → ${triggered} (${di.label})`);
+        const willTrigger = config.armed && triggered && !alarmTriggered;
+        await logDIEvent(di.ch, triggered, willTrigger);
 
-        // Si alarme armée et DI passe à HIGH → déclencher
+        // Si alarme armée et DI passe en alerte → déclencher
         if (willTrigger) {
           await triggerAlarm(di.ch, config);
         }
       }
 
-      lastDIState[di.ch] = val;
+      lastDIState[di.ch] = triggered;
     }
   } catch (e) {
     console.error("pollDI error:", e?.message || e);
@@ -407,10 +411,33 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
     const config = await loadAlarmConfig();
     const { armed, zones, excluded_do, siren_duration } = req.body;
 
-    if (typeof armed === "boolean") config.armed = armed;
     if (Array.isArray(zones)) config.armed_zones = zones.filter(z => ZONES[z]);
     if (Array.isArray(excluded_do)) config.excluded_do = [...new Set(excluded_do.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 7))];
     if (typeof siren_duration === "number" && siren_duration > 0) config.siren_duration = Math.min(600, siren_duration);
+
+    // Si on tente d'armer → vérifier que toutes les portes/fenêtres sont fermées
+    if (armed === true && !config.armed) {
+      const openDoors = DI_MAP.filter(di => {
+        if (di.type !== "porte") return false;
+        // Vérifier si ce DI est dans une zone qu'on veut armer
+        const diZones = di.zone.split(",").map(z => z.trim());
+        const inArmedZone = diZones.some(z => config.armed_zones.includes(z));
+        if (!inArmedZone) return false;
+        // currentDIState stocke déjà la valeur logique (true = déclenché/ouvert)
+        return !!currentDIState[di.ch];
+      });
+
+      if (openDoors.length > 0) {
+        const names = openDoors.map(d => d.label).join(", ");
+        return res.status(400).json({
+          ok: false,
+          error: `Impossible d'armer : porte(s)/fenêtre(s) ouverte(s) → ${names}`,
+          open_doors: openDoors.map(d => ({ ch: d.ch, label: d.label, zone: d.zone })),
+        });
+      }
+    }
+
+    if (typeof armed === "boolean") config.armed = armed;
 
     await saveAlarmConfig(config);
 
@@ -433,7 +460,27 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
 app.post("/alarm/toggle", requireAuth, async (req, res) => {
   try {
     const config = await loadAlarmConfig();
-    config.armed = !!req.body.armed;
+    const desired = !!req.body.armed;
+
+    // Si on tente d'armer → vérifier portes/fenêtres
+    if (desired && !config.armed) {
+      const openDoors = DI_MAP.filter(di => {
+        if (di.type !== "porte") return false;
+        const diZones = di.zone.split(",").map(z => z.trim());
+        const inArmedZone = diZones.some(z => config.armed_zones.includes(z));
+        if (!inArmedZone) return false;
+        return !!currentDIState[di.ch];
+      });
+      if (openDoors.length > 0) {
+        const names = openDoors.map(d => d.label).join(", ");
+        return res.status(400).json({
+          ok: false,
+          error: `Impossible d'armer : porte(s)/fenêtre(s) ouverte(s) → ${names}`,
+        });
+      }
+    }
+
+    config.armed = desired;
     await saveAlarmConfig(config);
 
     if (!config.armed && alarmTriggered) {
@@ -485,13 +532,16 @@ app.get("/api/di/status", requireAuth, async (req, res) => {
 app.get("/api/di/read", requireAuth, async (req, res) => {
   try {
     const bits = await readDI();
-    const status = DI_MAP.map(di => ({
-      ch: di.ch,
-      zone: di.zone,
-      label: di.label,
-      type: di.type,
-      value: !!bits[di.ch],
-    }));
+    const status = DI_MAP.map(di => {
+      const rawVal = !!bits[di.ch];
+      return {
+        ch: di.ch,
+        zone: di.zone,
+        label: di.label,
+        type: di.type,
+        value: di.inverted ? !rawVal : rawVal,
+      };
+    });
     res.json({ ok: true, inputs: status });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
