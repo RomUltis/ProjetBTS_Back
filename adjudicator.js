@@ -204,7 +204,8 @@ let lastDIState = {};    // { 4: false, 5: false, ... }
 let currentDIState = {}; // idem, mis à jour par le polling
 let alarmTriggered = false;
 let alarmTriggerInfo = null;
-let sirenTimeouts = [];  // pour pouvoir annuler les timeouts sirènes
+let sirenActiveUntil = 0;  // timestamp (ms) jusqu'auquel les sirènes restent actives
+let sirenChannelsActive = []; // channels sirène actuellement ON
 
 // Charger la config alarme depuis MySQL
 async function loadAlarmConfig() {
@@ -245,68 +246,73 @@ async function logDIEvent(ch, value, triggered) {
 }
 
 // Déclencher l'alarme sur les DO appropriés
+// → Active TOUTES les zones armées, pas seulement celle du capteur déclenché
 async function triggerAlarm(diChannel, config) {
   const diInfo = DI_MAP.find(d => d.ch === diChannel);
   if (!diInfo) return;
 
-  // Zones concernées par ce DI
+  // Vérifier que le DI est dans une zone armée
   const diZones = diInfo.zone.split(",").map(z => z.trim());
-
-  // Filtrer : ne garder que les zones armées
-  const activeZones = diZones.filter(z => config.armed_zones.includes(z));
-  if (activeZones.length === 0) return;
+  const triggerZones = diZones.filter(z => config.armed_zones.includes(z));
+  if (triggerZones.length === 0) return;
 
   alarmTriggered = true;
   alarmTriggerInfo = {
     diChannel,
     diLabel: diInfo.label,
-    zones: activeZones,
+    zones: triggerZones,
+    allArmedZones: config.armed_zones,
     time: new Date().toISOString(),
   };
 
-  console.log(`🚨 ALARME DÉCLENCHÉE par DI${diChannel} (${diInfo.label}) — zones: ${activeZones.join(", ")}`);
+  const sirenMs = (config.siren_duration || 180) * 1000;
+  sirenActiveUntil = Date.now() + sirenMs;
 
-  // Trouver les DO à activer (hors exclusions)
+  console.log(`🚨 ALARME DÉCLENCHÉE par DI${diChannel} (${diInfo.label}) — sirène: ${config.siren_duration}s — activation: TOUTES zones armées (${config.armed_zones.join(", ")})`);
+
+  // Activer les DO de TOUTES les zones armées (hors exclusions)
   const dosToActivate = DO_MAP.filter(d => {
-    // Exclure les DO dans la liste d'exclusion
     if (config.excluded_do.includes(d.ch)) return false;
-    // Garder seulement ceux des zones actives
-    return activeZones.includes(d.zone);
+    return config.armed_zones.includes(d.zone);
   });
 
-  // Activer les flashs → restent ON jusqu'à désarmement
-  // Activer les sirènes → ON pendant siren_duration puis OFF
+  sirenChannelsActive = [];
+
   for (const doItem of dosToActivate) {
     try {
       await petWriteCoil(doItem.ch, true);
       console.log(`  ✓ DO${doItem.ch} ON (${doItem.zone} — ${doItem.role})`);
+      if (doItem.role === "sirene") {
+        sirenChannelsActive.push(doItem.ch);
+      }
     } catch (e) {
       console.error(`  ✗ DO${doItem.ch} ON failed:`, e?.message || e);
     }
   }
+}
 
-  // Programmer l'arrêt des sirènes après siren_duration
-  const sirenDOs = dosToActivate.filter(d => d.role === "sirene");
-  const sirenMs = (config.siren_duration || 180) * 1000;
+// Vérifier périodiquement si les sirènes doivent être coupées
+async function checkSirenTimeout() {
+  if (!alarmTriggered || sirenChannelsActive.length === 0) return;
+  if (Date.now() < sirenActiveUntil) return;
 
-  for (const doItem of sirenDOs) {
-    const t = setTimeout(async () => {
-      try {
-        await petWriteCoil(doItem.ch, false);
-        console.log(`  ⏱ DO${doItem.ch} OFF (sirène ${doItem.zone} — timeout ${config.siren_duration}s)`);
-      } catch (e) {
-        console.error(`  ✗ DO${doItem.ch} OFF (sirène timeout) failed:`, e?.message || e);
-      }
-    }, sirenMs);
-    sirenTimeouts.push(t);
+  // Temps écoulé → couper les sirènes
+  console.log(`⏱ Timeout sirène atteint — coupure des sirènes`);
+  for (const ch of sirenChannelsActive) {
+    try {
+      await petWriteCoil(ch, false);
+      console.log(`  ⏱ DO${ch} OFF (sirène — timeout)`);
+    } catch (e) {
+      console.error(`  ✗ DO${ch} OFF (sirène timeout) failed:`, e?.message || e);
+    }
   }
+  sirenChannelsActive = [];
 }
 
 // Désarmer : tout couper
 async function disarmAlarm() {
-  // Annuler les timeouts sirènes en cours
-  sirenTimeouts.forEach(t => clearTimeout(t));
-  sirenTimeouts = [];
+  sirenActiveUntil = 0;
+  sirenChannelsActive = [];
 
   // Couper tous les DO (sauf gâche DO0 qui est contrôle d'accès)
   for (const doItem of DO_MAP) {
@@ -328,6 +334,9 @@ let pollInterval = null;
 
 async function pollDI() {
   try {
+    // Vérifier si les sirènes doivent être coupées
+    await checkSirenTimeout();
+
     const bits = await readDI();
     const config = await loadAlarmConfig();
 
