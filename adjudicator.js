@@ -440,7 +440,11 @@ async function pollDI() {
       if (prev !== undefined && prev !== triggered) {
         console.log(`DI${di.ch} changé: ${prev} → ${triggered} (${di.label})`);
         const willTrigger = config.armed && triggered && !alarmTriggered;
-        await logDIEvent(di.ch, triggered, willTrigger);
+
+        // Logger uniquement si l'alarme est armée
+        if (config.armed) {
+          await logDIEvent(di.ch, triggered, willTrigger);
+        }
 
         // Si alarme armée et DI passe en alerte → déclencher
         if (willTrigger) {
