@@ -207,6 +207,94 @@ let alarmTriggerInfo = null;
 let sirenActiveUntil = 0;  // timestamp (ms) jusqu'auquel les sirènes restent actives
 let sirenChannelsActive = []; // channels sirène actuellement ON
 
+// ─── ARMEMENT AUTOMATIQUE PAR HORAIRE ───────────────────────
+let armedBySchedule = false;  // true si c'est le schedule qui a armé (pas un humain)
+
+// Vérifie si l'heure actuelle est dans une plage horaire
+function isInSchedule(slots) {
+  if (!slots || slots.length === 0) return false;
+
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mm = String(now.getMinutes()).padStart(2, "0");
+  const current = `${hh}:${mm}`;
+
+  for (const slot of slots) {
+    if (!slot.start || !slot.end) continue;
+
+    if (slot.start <= slot.end) {
+      // Plage simple : ex 08:00 → 18:00
+      if (current >= slot.start && current < slot.end) return true;
+    } else {
+      // Plage qui traverse minuit : ex 21:00 → 07:00
+      if (current >= slot.start || current < slot.end) return true;
+    }
+  }
+  return false;
+}
+
+// Charger les plages horaires depuis MySQL
+async function loadScheduleSlots() {
+  try {
+    const rows = await dbQuery("SELECT `id`, `start`, `end` FROM `schedule_slots` ORDER BY `id`");
+    return rows;
+  } catch (e) {
+    console.error("loadScheduleSlots error:", e.message);
+    return [];
+  }
+}
+
+// Vérifie le schedule et arme/désarme automatiquement
+async function checkSchedule() {
+  try {
+    const slots = await loadScheduleSlots();
+    const inSchedule = isInSchedule(slots);
+    const config = await loadAlarmConfig();
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+
+    console.log(`⏰ Schedule check: ${hh}:${mm} | ${slots.length} plage(s) | inSchedule=${inSchedule} | armed=${config.armed} | armedBySchedule=${armedBySchedule}`);
+
+    if (inSchedule && !config.armed) {
+      // On entre dans une plage → armer automatiquement
+      // Vérifier que les portes sont fermées d'abord
+      const openDoors = DI_MAP.filter(di => {
+        if (di.type !== "porte") return false;
+        const diZones = di.zone.split(",").map(z => z.trim());
+        const inArmedZone = diZones.some(z => config.armed_zones.includes(z));
+        if (!inArmedZone) return false;
+        return !!currentDIState[di.ch];
+      });
+
+      if (openDoors.length > 0) {
+        console.log(`⏰ Schedule: dans la plage mais porte(s) ouverte(s) → armement impossible (${openDoors.map(d => d.label).join(", ")})`);
+        return;
+      }
+
+      config.armed = true;
+      await saveAlarmConfig(config);
+      armedBySchedule = true;
+      console.log(`⏰ Schedule: ARMEMENT AUTOMATIQUE effectué`);
+
+    } else if (!inSchedule && config.armed && armedBySchedule) {
+      // On sort de la plage → désarmer SEULEMENT si pas d'alarme déclenchée
+      if (alarmTriggered) {
+        console.log(`⏰ Schedule: fin de plage mais alarme en cours → on ne désarme PAS`);
+        return;
+      }
+
+      config.armed = false;
+      await saveAlarmConfig(config);
+      armedBySchedule = false;
+      console.log(`⏰ Schedule: DÉSARMEMENT AUTOMATIQUE (fin de plage, aucune détection)`);
+    }
+  } catch (e) {
+    console.error("checkSchedule error:", e.message);
+  }
+}
+
 // Charger la config alarme depuis MySQL
 async function loadAlarmConfig() {
   try {
@@ -377,6 +465,10 @@ function startPolling() {
   pollInterval = setInterval(pollDI, DI_POLL_MS);
   // Première lecture immédiate
   pollDI();
+
+  // Vérification du schedule toutes les 30s
+  setInterval(checkSchedule, 30000);
+  checkSchedule(); // vérif immédiate au démarrage
 }
 
 // ─── ROUTES API ─────────────────────────────────────────────
@@ -397,6 +489,7 @@ app.get("/api/alarm/status", requireAuth, async (req, res) => {
       siren_duration: config.siren_duration,
       alarm_triggered: alarmTriggered,
       alarm_info: alarmTriggerInfo,
+      armed_by_schedule: armedBySchedule,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -448,6 +541,9 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
 
     if (typeof armed === "boolean") config.armed = armed;
 
+    // Armement/désarmement manuel → le schedule ne doit pas interférer
+    if (typeof armed === "boolean") armedBySchedule = false;
+
     await saveAlarmConfig(config);
 
     // Si désarmement → couper les DO
@@ -490,6 +586,7 @@ app.post("/alarm/toggle", requireAuth, async (req, res) => {
     }
 
     config.armed = desired;
+    armedBySchedule = false; // Armement manuel → schedule ne désarme pas
     await saveAlarmConfig(config);
 
     if (!config.armed && alarmTriggered) {
@@ -511,6 +608,7 @@ app.post("/api/alarm/disarm", requireAuth, async (req, res) => {
   try {
     const config = await loadAlarmConfig();
     config.armed = false;
+    armedBySchedule = false;
     await saveAlarmConfig(config);
     await disarmAlarm();
     res.json({ ok: true, msg: "Désarmé, tous les DO coupés" });
@@ -658,7 +756,7 @@ app.post("/api/pet/do/test-selected", requireAuth, async (req, res) => {
 // GET /schedule — récupérer les plages horaires
 app.get("/schedule", requireAuth, async (req, res) => {
   try {
-    const rows = await dbQuery("SELECT * FROM schedule_slots ORDER BY id");
+    const rows = await dbQuery("SELECT `id`, `start`, `end` FROM `schedule_slots` ORDER BY `id`");
     res.json({ slots: rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -669,10 +767,10 @@ app.get("/schedule", requireAuth, async (req, res) => {
 app.put("/schedule", requireAuth, async (req, res) => {
   try {
     const slots = Array.isArray(req.body?.slots) ? req.body.slots : [];
-    await dbQuery("DELETE FROM schedule_slots");
+    await dbQuery("DELETE FROM `schedule_slots`");
     for (const s of slots) {
       if (s.start && s.end) {
-        await dbQuery("INSERT INTO schedule_slots (`start`, `end`) VALUES (?, ?)", [s.start, s.end]);
+        await dbQuery("INSERT INTO `schedule_slots` (`start`, `end`) VALUES (?, ?)", [s.start, s.end]);
       }
     }
     res.json({ ok: true, slots });
