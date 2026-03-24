@@ -51,7 +51,7 @@ const ZONES = {
 // Tous inversés : la PET-7050 renvoie HIGH = repos/fermé, LOW = alerte/ouvert
 const DI_MAP = [
   { ch: 4, zone: "ciel1", label: "Détecteur mouvement CIEL 1", type: "mouvement", inverted: true },
-  { ch: 5, zone: "ciel1,ciel2", label: "Porte transition CIEL 1-2 / fenêtre", type: "porte", inverted: true },
+  { ch: 5, zone: "ciel1", label: "Porte transition CIEL 1-2 / fenêtre", type: "porte", inverted: true },
   { ch: 6, zone: "ciel2", label: "Détecteur mouvement CIEL 2", type: "mouvement", inverted: true },
   { ch: 7, zone: "ciel2", label: "Porte CIEL 2 + fenêtre", type: "porte", inverted: true },
   { ch: 8, zone: "physique", label: "Détecteur mouvement Physique", type: "mouvement", inverted: true },
@@ -207,6 +207,14 @@ let alarmTriggerInfo = null;
 let sirenActiveUntil = 0;  // timestamp (ms) jusqu'auquel les sirènes restent actives
 let sirenChannelsActive = []; // channels sirène actuellement ON
 
+// ─── MODE ENROLLMENT RFID ──────────────────────────────────
+let enrollMode = {
+  active: false,
+  startedAt: 0,       // timestamp ms
+  expiresAt: 0,       // timestamp ms
+  detectedUid: null,   // UID détecté pendant l'enrollment
+};
+
 // ─── ARMEMENT AUTOMATIQUE PAR HORAIRE ───────────────────────
 let armedBySchedule = false;  // true si c'est le schedule qui a armé (pas un humain)
 
@@ -356,12 +364,14 @@ async function triggerAlarm(diChannel, config) {
   const sirenMs = (config.siren_duration || 180) * 1000;
   sirenActiveUntil = Date.now() + sirenMs;
 
-  console.log(`🚨 ALARME DÉCLENCHÉE par DI${diChannel} (${diInfo.label}) — sirène: ${config.siren_duration}s — activation: TOUTES zones armées (${config.armed_zones.join(", ")})`);
+  console.log(`🚨 ALARME DÉCLENCHÉE par DI${diChannel} (${diInfo.label}) — sirène: ${config.siren_duration}s — activation: TOUTES les zones (y compris non surveillées)`);
 
-  // Activer les DO de TOUTES les zones armées (hors exclusions)
+  // Activer les DO de TOUTES les zones (pas seulement les armées)
+  // Les zones exclues ne sont pas surveillées mais elles sonnent quand même
+  // Seules les exclusions DO individuelles sont respectées
   const dosToActivate = DO_MAP.filter(d => {
     if (config.excluded_do.includes(d.ch)) return false;
-    return config.armed_zones.includes(d.zone);
+    return true; // toutes les zones sonnent
   });
 
   sirenChannelsActive = [];
@@ -397,12 +407,20 @@ async function checkSirenTimeout() {
   sirenChannelsActive = [];
 }
 
-// Désarmer : tout couper
+// Désarmer : tout couper + ouvrir la gâche
 async function disarmAlarm() {
   sirenActiveUntil = 0;
   sirenChannelsActive = [];
 
-  // Couper tous les DO (sauf gâche DO0 qui est contrôle d'accès)
+  // Ouvrir la gâche (DO0, pulse 3s) pour permettre d'entrer
+  try {
+    await petPulseCoil(0, 3000);
+    console.log("🔓 Gâche ouverte (désarmement)");
+  } catch (e) {
+    console.error("Gâche (désarmement) failed:", e?.message || e);
+  }
+
+  // Couper tous les DO (sauf gâche DO0 qui vient d'être pulsée)
   for (const doItem of DO_MAP) {
     if (doItem.role === "gache") continue;
     try {
@@ -845,6 +863,195 @@ app.delete("/rfid/:id", requireAuth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+app.post("/rfid/scan", async (req, res) => {
+  try {
+    const { card_id, raw_hex, wiegand_type } = req.body || {};
+ 
+    if (!card_id) {
+      return res.status(400).json({ ok: false, error: "card_id manquant" });
+    }
+ 
+    console.log(`[RFID] Scan reçu: card_id=${card_id}, raw=${raw_hex}, type=W${wiegand_type}`);
+
+    // ── Mode enrollment actif ? ──
+    if (enrollMode.active && Date.now() < enrollMode.expiresAt) {
+      console.log(`[RFID] Mode enrollment → badge capturé: ${card_id}`);
+      enrollMode.detectedUid = card_id;
+      enrollMode.active = false; // arrêter l'enrollment
+      return res.json({ ok: true, enrollment: true, message: "Badge capturé pour enrollment" });
+    }
+
+    // Si enrollment expiré, le désactiver proprement
+    if (enrollMode.active && Date.now() >= enrollMode.expiresAt) {
+      enrollMode.active = false;
+      enrollMode.detectedUid = null;
+    }
+ 
+    // ── Comportement normal ──
+    // Chercher le badge dans la BDD (par UID)
+    const rows = await dbQuery(
+      "SELECT * FROM rfid_badges WHERE uid = ? LIMIT 1",
+      [card_id]
+    );
+ 
+    if (rows.length === 0) {
+      console.log(`[RFID] Badge inconnu: ${card_id}`);
+ 
+      try {
+        await dbQuery(
+          "INSERT INTO di_events (channel, zone, label, old_val, new_val, triggered) VALUES (?, ?, ?, ?, ?, ?)",
+          [-1, "rfid", `Badge inconnu: ${card_id}`, 0, 1, 0]
+        );
+      } catch (e) { /* ignore log errors */ }
+ 
+      return res.json({ ok: true, authorized: false, message: "Badge inconnu" });
+    }
+ 
+    const badge = rows[0];
+ 
+    if (!badge.enabled) {
+      console.log(`[RFID] Badge désactivé: ${card_id} (${badge.owner})`);
+      return res.json({ ok: true, authorized: false, message: "Badge désactivé" });
+    }
+ 
+    // Badge autorisé → ouvrir la gâche + toggle alarme
+    console.log(`[RFID] ✓ Accès autorisé: ${badge.owner} (${card_id})`);
+
+    // Ouvrir la gâche (DO0, pulse 3s)
+    try {
+      await petPulseCoil(0, 3000);
+    } catch (e) {
+      console.error("[RFID] Erreur gâche:", e.message);
+    }
+
+    // Toggle alarme
+    const config = await loadAlarmConfig();
+    let newArmedState;
+    let alarmAction;
+
+    if (config.armed) {
+      // Désarmer
+      config.armed = false;
+      armedBySchedule = false;
+      await saveAlarmConfig(config);
+      if (alarmTriggered) {
+        await disarmAlarm();
+      } else {
+        alarmTriggered = false;
+        alarmTriggerInfo = null;
+      }
+      newArmedState = false;
+      alarmAction = "disarmed";
+      console.log(`[RFID] 🔓 Alarme DÉSARMÉE par ${badge.owner}`);
+    } else {
+      // Armer — vérifier les portes d'abord
+      const openDoors = DI_MAP.filter(di => {
+        if (di.type !== "porte") return false;
+        const diZones = di.zone.split(",").map(z => z.trim());
+        const inArmedZone = diZones.some(z => config.armed_zones.includes(z));
+        if (!inArmedZone) return false;
+        return !!currentDIState[di.ch];
+      });
+
+      if (openDoors.length > 0) {
+        const names = openDoors.map(d => d.label).join(", ");
+        console.log(`[RFID] ⚠ Armement impossible — portes ouvertes: ${names}`);
+
+        try {
+          await dbQuery(
+            "INSERT INTO di_events (channel, zone, label, old_val, new_val, triggered) VALUES (?, ?, ?, ?, ?, ?)",
+            [-1, "rfid", `Armement refusé (portes ouvertes): ${badge.owner}`, 0, 1, 0]
+          );
+        } catch (e) { /* ignore */ }
+
+        return res.json({
+          ok: true,
+          authorized: true,
+          owner: badge.owner,
+          alarm_action: "arm_failed",
+          message: `Armement impossible — portes ouvertes: ${names}`,
+        });
+      }
+
+      config.armed = true;
+      armedBySchedule = false;
+      await saveAlarmConfig(config);
+      newArmedState = true;
+      alarmAction = "armed";
+      console.log(`[RFID] 🔒 Alarme ARMÉE par ${badge.owner}`);
+    }
+ 
+    try {
+      await dbQuery(
+        "INSERT INTO di_events (channel, zone, label, old_val, new_val, triggered) VALUES (?, ?, ?, ?, ?, ?)",
+        [-1, "rfid", `${alarmAction === "armed" ? "Armement" : "Désarmement"} par ${badge.owner} (${card_id})`, 0, 1, 0]
+      );
+    } catch (e) { /* ignore log errors */ }
+ 
+    return res.json({
+      ok: true,
+      authorized: true,
+      owner: badge.owner,
+      alarm_action: alarmAction,
+      armed: newArmedState,
+      message: alarmAction === "armed" ? "Alarme armée" : "Alarme désarmée",
+    });
+ 
+  } catch (e) {
+    console.error("[RFID] Erreur scan:", e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── RFID ENROLLMENT (détection automatique) ──
+
+// POST /rfid/enroll/start — active le mode enrollment pour 60s
+app.post("/rfid/enroll/start", requireAuth, (req, res) => {
+  const duration = 60000; // 60 secondes
+  enrollMode.active = true;
+  enrollMode.startedAt = Date.now();
+  enrollMode.expiresAt = Date.now() + duration;
+  enrollMode.detectedUid = null;
+
+  console.log("[RFID] Mode enrollment activé pour 60s");
+
+  // Auto-expiration
+  setTimeout(() => {
+    if (enrollMode.active && Date.now() >= enrollMode.expiresAt) {
+      enrollMode.active = false;
+      console.log("[RFID] Mode enrollment expiré");
+    }
+  }, duration + 500);
+
+  res.json({ ok: true, message: "Mode enrollment activé", expiresAt: enrollMode.expiresAt });
+});
+
+// GET /rfid/enroll/status — état du mode enrollment
+app.get("/rfid/enroll/status", requireAuth, (req, res) => {
+  // Si expiré, désactiver
+  if (enrollMode.active && Date.now() >= enrollMode.expiresAt) {
+    enrollMode.active = false;
+  }
+
+  const remainingMs = enrollMode.active
+    ? Math.max(0, enrollMode.expiresAt - Date.now())
+    : 0;
+
+  res.json({
+    ok: true,
+    active: enrollMode.active,
+    detected_uid: enrollMode.detectedUid,
+    remaining_seconds: Math.ceil(remainingMs / 1000),
+  });
+});
+
+// POST /rfid/enroll/stop — arrêter manuellement l'enrollment
+app.post("/rfid/enroll/stop", requireAuth, (req, res) => {
+  enrollMode.active = false;
+  console.log("[RFID] Mode enrollment arrêté manuellement");
+  res.json({ ok: true, detected_uid: enrollMode.detectedUid });
 });
 
 // ─── DÉMARRAGE ──────────────────────────────────────────────
