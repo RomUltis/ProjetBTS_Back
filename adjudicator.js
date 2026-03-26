@@ -5,6 +5,9 @@ const mysql = require("mysql");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const ModbusRTU = require("modbus-serial");
+const { spawn } = require("child_process");
+const path = require("path");
+const fs = require("fs");
 
 const app = express();
 app.use(express.json());
@@ -38,6 +41,10 @@ const PULSE_MS_DEFAULT = 1000;
 const PULSE_MS_MIN = 100;
 const PULSE_MS_MAX = 3000;
 const TEST_DELAY_DEFAULT = 1200;
+
+// Enregistrement caméra
+const RTSP_URL = process.env.RTSP_URL || "";
+const RECORDINGS_PATH = process.env.RECORDINGS_PATH || "/sftp/camciel1/upload";
 
 // ─── MAPPING DI / DO / ZONES ────────────────────────────────
 
@@ -390,6 +397,9 @@ async function triggerAlarm(diChannel, config) {
       console.error(`  ✗ DO${doItem.ch} ON failed:`, e?.message || e);
     }
   }
+
+  // Lancer l'enregistrement automatique de la caméra
+  startRecording("alarm");
 }
 
 // Vérifier périodiquement si les sirènes doivent être coupées
@@ -435,6 +445,13 @@ async function disarmAlarm() {
 
   alarmTriggered = false;
   alarmTriggerInfo = null;
+
+  // Arrêter l'enregistrement automatique s'il est en cours
+  if (recordingAutoAlarm && recordingProcess) {
+    stopRecording();
+    console.log("🔓 Enregistrement alarme arrêté automatiquement");
+  }
+
   console.log("🔓 Alarme désarmée — tous les DO coupés");
 }
 
@@ -568,6 +585,8 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
       }
     }
 
+    const wasArmed = config.armed;
+
     if (typeof armed === "boolean") config.armed = armed;
 
     // Armement/désarmement manuel → le schedule ne doit pas interférer
@@ -575,8 +594,8 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
 
     await saveAlarmConfig(config);
 
-    // Double bip de confirmation à l'armement
-    if (config.armed && armed === true && beepEnabled) {
+    // Double bip seulement si on PASSE de désarmé à armé
+    if (config.armed && !wasArmed && beepEnabled) {
       const bipDOs = DO_MAP.filter(d => d.role !== "gache");
       for (let bip = 0; bip < 2; bip++) {
         for (const doItem of bipDOs) {
@@ -591,8 +610,8 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
       console.log(`🔔🔔 Double bip armement (dashboard)`);
     }
 
-    // Si désarmement → couper les DO + bip simple
-    if (!config.armed && armed === false && beepEnabled) {
+    // Bip simple seulement si on PASSE de armé à désarmé
+    if (!config.armed && wasArmed && beepEnabled) {
       const bipDOs = DO_MAP.filter(d => d.role !== "gache");
       for (const doItem of bipDOs) {
         try { await petWriteCoil(doItem.ch, true); } catch {}
@@ -1112,6 +1131,133 @@ app.post("/rfid/enroll/stop", requireAuth, (req, res) => {
   enrollMode.active = false;
   console.log("[RFID] Mode enrollment arrêté manuellement");
   res.json({ ok: true, detected_uid: enrollMode.detectedUid });
+});
+
+// ─── ENREGISTREMENT CAMÉRA (FFmpeg) ────────────────────────
+
+let recordingProcess = null;
+let recordingStartTime = null;
+let recordingFilename = null;
+let recordingAutoAlarm = false; // true si lancé automatiquement par l'alarme
+
+// Fonction utilitaire : démarrer un enregistrement
+function startRecording(source = "manual") {
+  if (recordingProcess) return { ok: false, reason: "already_recording" };
+  if (!RTSP_URL) return { ok: false, reason: "no_rtsp_url" };
+
+  try {
+    if (!fs.existsSync(RECORDINGS_PATH)) {
+      fs.mkdirSync(RECORDINGS_PATH, { recursive: true });
+    }
+  } catch (e) {
+    console.error("[REC] Impossible de créer le dossier:", e.message);
+    return { ok: false, reason: e.message };
+  }
+
+  const now = new Date();
+  const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const prefix = source === "alarm" ? "alarme" : "rec";
+  recordingFilename = `${prefix}_${ts}.mp4`;
+  const filepath = path.join(RECORDINGS_PATH, recordingFilename);
+
+  recordingProcess = spawn("ffmpeg", [
+    "-rtsp_transport", "tcp",
+    "-i", RTSP_URL,
+    "-c:v", "copy",
+    "-c:a", "aac",
+    "-y",
+    filepath,
+  ]);
+
+  recordingStartTime = Date.now();
+  recordingAutoAlarm = (source === "alarm");
+
+  recordingProcess.stderr.on("data", () => {});
+
+  recordingProcess.on("error", (err) => {
+    console.error("[REC] Erreur FFmpeg:", err.message);
+    recordingProcess = null;
+    recordingStartTime = null;
+    recordingFilename = null;
+    recordingAutoAlarm = false;
+  });
+
+  recordingProcess.on("close", (code) => {
+    console.log(`[REC] FFmpeg terminé (code ${code}) — ${recordingFilename}`);
+    recordingProcess = null;
+    recordingStartTime = null;
+    recordingFilename = null;
+    recordingAutoAlarm = false;
+  });
+
+  console.log(`[REC] ⏺ Enregistrement démarré (${source}) → ${filepath}`);
+  return { ok: true, filename: recordingFilename, path: filepath };
+}
+
+// Fonction utilitaire : arrêter l'enregistrement
+function stopRecording() {
+  if (!recordingProcess) return { ok: false, reason: "not_recording" };
+
+  const filename = recordingFilename;
+  const duration = Math.round((Date.now() - recordingStartTime) / 1000);
+
+  recordingProcess.kill("SIGINT");
+
+  console.log(`[REC] ⏹ Enregistrement arrêté — ${filename} (${duration}s)`);
+  return { ok: true, filename, duration_seconds: duration };
+}
+
+// POST /api/cam/record/start — lancer l'enregistrement
+app.post("/api/cam/record/start", requireAuth, (req, res) => {
+  const result = startRecording("manual");
+  if (!result.ok) {
+    return res.status(400).json({ ok: false, error: result.reason });
+  }
+  res.json(result);
+});
+
+// POST /api/cam/record/stop — arrêter l'enregistrement
+app.post("/api/cam/record/stop", requireAuth, (req, res) => {
+  const result = stopRecording();
+  if (!result.ok) {
+    return res.status(400).json({ ok: false, error: result.reason });
+  }
+  res.json(result);
+});
+
+// GET /api/cam/record/status — état de l'enregistrement
+app.get("/api/cam/record/status", requireAuth, (req, res) => {
+  if (!recordingProcess || !recordingStartTime) {
+    return res.json({ ok: true, recording: false });
+  }
+
+  const elapsed = Math.round((Date.now() - recordingStartTime) / 1000);
+  res.json({
+    ok: true,
+    recording: true,
+    filename: recordingFilename,
+    elapsed_seconds: elapsed,
+    auto_alarm: recordingAutoAlarm,
+  });
+});
+
+// GET /api/cam/recordings — liste des fichiers enregistrés
+app.get("/api/cam/recordings", requireAuth, (req, res) => {
+  try {
+    if (!fs.existsSync(RECORDINGS_PATH)) {
+      return res.json({ ok: true, files: [] });
+    }
+    const files = fs.readdirSync(RECORDINGS_PATH)
+      .filter(f => f.endsWith(".mp4"))
+      .map(f => {
+        const stat = fs.statSync(path.join(RECORDINGS_PATH, f));
+        return { name: f, size_mb: (stat.size / 1024 / 1024).toFixed(1), date: stat.mtime };
+      })
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+    res.json({ ok: true, files });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ─── DÉMARRAGE ──────────────────────────────────────────────
