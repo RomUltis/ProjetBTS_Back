@@ -215,6 +215,9 @@ let enrollMode = {
   detectedUid: null,   // UID détecté pendant l'enrollment
 };
 
+// ─── BIPS SONORES (activé/désactivé depuis le dashboard) ───
+let beepEnabled = true;
+
 // ─── ARMEMENT AUTOMATIQUE PAR HORAIRE ───────────────────────
 let armedBySchedule = false;  // true si c'est le schedule qui a armé (pas un humain)
 
@@ -512,6 +515,7 @@ app.get("/api/alarm/status", requireAuth, async (req, res) => {
       alarm_triggered: alarmTriggered,
       alarm_info: alarmTriggerInfo,
       armed_by_schedule: armedBySchedule,
+      beep_enabled: beepEnabled,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -533,7 +537,10 @@ app.get("/alarm/status", requireAuth, async (req, res) => {
 app.post("/api/alarm/arm", requireAuth, async (req, res) => {
   try {
     const config = await loadAlarmConfig();
-    const { armed, zones, excluded_do, siren_duration } = req.body;
+    const { armed, zones, excluded_do, siren_duration, beep } = req.body;
+
+    // Mettre à jour l'état des bips
+    if (typeof beep === "boolean") beepEnabled = beep;
 
     if (Array.isArray(zones)) config.armed_zones = zones.filter(z => ZONES[z]);
     if (Array.isArray(excluded_do)) config.excluded_do = [...new Set(excluded_do.map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 7))];
@@ -568,7 +575,35 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
 
     await saveAlarmConfig(config);
 
-    // Si désarmement → couper les DO
+    // Double bip de confirmation à l'armement
+    if (config.armed && armed === true && beepEnabled) {
+      const bipDOs = DO_MAP.filter(d => d.role !== "gache");
+      for (let bip = 0; bip < 2; bip++) {
+        for (const doItem of bipDOs) {
+          try { await petWriteCoil(doItem.ch, true); } catch {}
+        }
+        await new Promise(r => setTimeout(r, 150));
+        for (const doItem of bipDOs) {
+          try { await petWriteCoil(doItem.ch, false); } catch {}
+        }
+        if (bip === 0) await new Promise(r => setTimeout(r, 150));
+      }
+      console.log(`🔔🔔 Double bip armement (dashboard)`);
+    }
+
+    // Si désarmement → couper les DO + bip simple
+    if (!config.armed && armed === false && beepEnabled) {
+      const bipDOs = DO_MAP.filter(d => d.role !== "gache");
+      for (const doItem of bipDOs) {
+        try { await petWriteCoil(doItem.ch, true); } catch {}
+      }
+      await new Promise(r => setTimeout(r, 150));
+      for (const doItem of bipDOs) {
+        try { await petWriteCoil(doItem.ch, false); } catch {}
+      }
+      console.log(`🔔 Bip désarmement (dashboard)`);
+    }
+
     if (!config.armed && alarmTriggered) {
       await disarmAlarm();
     }
@@ -916,15 +951,8 @@ app.post("/rfid/scan", async (req, res) => {
       return res.json({ ok: true, authorized: false, message: "Badge désactivé" });
     }
  
-    // Badge autorisé → ouvrir la gâche + toggle alarme
+    // Badge autorisé → toggle alarme
     console.log(`[RFID] ✓ Accès autorisé: ${badge.owner} (${card_id})`);
-
-    // Ouvrir la gâche (DO0, pulse 3s)
-    try {
-      await petPulseCoil(0, 3000);
-    } catch (e) {
-      console.error("[RFID] Erreur gâche:", e.message);
-    }
 
     // Toggle alarme
     const config = await loadAlarmConfig();
@@ -941,10 +969,26 @@ app.post("/rfid/scan", async (req, res) => {
       } else {
         alarmTriggered = false;
         alarmTriggerInfo = null;
+        // Ouvrir la gâche (pas d'alarme en cours, disarmAlarm ne sera pas appelé)
+        try { await petPulseCoil(0, 3000); } catch {}
+        console.log("[RFID] 🔓 Gâche ouverte (désarmement par badge)");
       }
       newArmedState = false;
       alarmAction = "disarmed";
       console.log(`[RFID] 🔓 Alarme DÉSARMÉE par ${badge.owner}`);
+
+      // Bip simple de confirmation désarmement
+      if (beepEnabled) {
+        const bipDOs = DO_MAP.filter(d => d.role !== "gache");
+        for (const doItem of bipDOs) {
+          try { await petWriteCoil(doItem.ch, true); } catch {}
+        }
+        await new Promise(r => setTimeout(r, 150));
+        for (const doItem of bipDOs) {
+          try { await petWriteCoil(doItem.ch, false); } catch {}
+        }
+        console.log(`[RFID] 🔔 Bip désarmement`);
+      }
     } else {
       // Armer — vérifier les portes d'abord
       const openDoors = DI_MAP.filter(di => {
@@ -981,6 +1025,22 @@ app.post("/rfid/scan", async (req, res) => {
       newArmedState = true;
       alarmAction = "armed";
       console.log(`[RFID] 🔒 Alarme ARMÉE par ${badge.owner}`);
+
+      // Double bip de confirmation armement
+      if (beepEnabled) {
+        const bipDOs2 = DO_MAP.filter(d => d.role !== "gache");
+        for (let bip = 0; bip < 2; bip++) {
+          for (const doItem of bipDOs2) {
+            try { await petWriteCoil(doItem.ch, true); } catch {}
+          }
+          await new Promise(r => setTimeout(r, 150));
+          for (const doItem of bipDOs2) {
+            try { await petWriteCoil(doItem.ch, false); } catch {}
+          }
+          if (bip === 0) await new Promise(r => setTimeout(r, 150));
+        }
+        console.log(`[RFID] 🔔🔔 Double bip armement`);
+      }
     }
  
     try {
