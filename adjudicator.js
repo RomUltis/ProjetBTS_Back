@@ -106,6 +106,13 @@ function requireAuth(req, res, next) {
   }
 }
 
+function requireAdmin(req, res, next) {
+  if (!req.user || req.user.role !== "admin") {
+    return res.status(403).json({ ok: false, error: "Accès réservé aux administrateurs" });
+  }
+  return next();
+}
+
 // ─── Register / Login ───────────────────────────────────────
 app.post("/register", (req, res) => {
   const { username, password } = req.body || {};
@@ -551,7 +558,7 @@ app.get("/alarm/status", requireAuth, async (req, res) => {
 
 // POST /api/alarm/arm — armement avancé
 // body: { armed: true, zones: ["ciel1","ciel2"], excluded_do: [0], siren_duration: 180 }
-app.post("/api/alarm/arm", requireAuth, async (req, res) => {
+app.post("/api/alarm/arm", requireAuth, requireAdmin, async (req, res) => {
   try {
     const config = await loadAlarmConfig();
     const { armed, zones, excluded_do, siren_duration, beep } = req.body;
@@ -638,7 +645,7 @@ app.post("/api/alarm/arm", requireAuth, async (req, res) => {
 });
 
 // Compat ancienne route toggle
-app.post("/alarm/toggle", requireAuth, async (req, res) => {
+app.post("/alarm/toggle", requireAuth, requireAdmin, async (req, res) => {
   try {
     const config = await loadAlarmConfig();
     const desired = !!req.body.armed;
@@ -680,7 +687,7 @@ app.post("/alarm/toggle", requireAuth, async (req, res) => {
 });
 
 // POST /api/alarm/disarm — désarmement + coupure forcée
-app.post("/api/alarm/disarm", requireAuth, async (req, res) => {
+app.post("/api/alarm/disarm", requireAuth, requireAdmin, async (req, res) => {
   try {
     const config = await loadAlarmConfig();
     config.armed = false;
@@ -772,7 +779,7 @@ app.get("/api/di/mapping", requireAuth, (req, res) => {
 
 // ── Sorties DO (existant, inchangé) ──
 
-app.post("/api/pet/do/pulse", requireAuth, async (req, res) => {
+app.post("/api/pet/do/pulse", requireAuth, requireAdmin, async (req, res) => {
   try {
     const channel = Number(req.body?.channel);
     const ms = clampMs(req.body?.ms ?? PULSE_MS_DEFAULT);
@@ -786,7 +793,7 @@ app.post("/api/pet/do/pulse", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/pet/do/test-all", requireAuth, async (req, res) => {
+app.post("/api/pet/do/test-all", requireAuth, requireAdmin, async (req, res) => {
   try {
     const ms = clampMs(req.body?.ms ?? PULSE_MS_DEFAULT);
     const delay = Math.min(5000, Math.max(200, Number(req.body?.delay ?? TEST_DELAY_DEFAULT)));
@@ -803,7 +810,7 @@ app.post("/api/pet/do/test-all", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/pet/do/test-selected", requireAuth, async (req, res) => {
+app.post("/api/pet/do/test-selected", requireAuth, requireAdmin, async (req, res) => {
   try {
     const ms = clampMs(req.body?.ms ?? PULSE_MS_DEFAULT);
     const delay = Math.min(5000, Math.max(200, Number(req.body?.delay ?? TEST_DELAY_DEFAULT)));
@@ -840,7 +847,7 @@ app.get("/schedule", requireAuth, async (req, res) => {
 });
 
 // PUT /schedule — remplacer toutes les plages
-app.put("/schedule", requireAuth, async (req, res) => {
+app.put("/schedule", requireAuth, requireAdmin, async (req, res) => {
   try {
     const slots = Array.isArray(req.body?.slots) ? req.body.slots : [];
     await dbQuery("DELETE FROM `schedule_slots`");
@@ -850,6 +857,59 @@ app.put("/schedule", requireAuth, async (req, res) => {
       }
     }
     res.json({ ok: true, slots });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// --- GESTION DES UTILISATEURS (admin only) ---
+
+// GET /api/users — liste des utilisateurs
+app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const rows = await dbQuery("SELECT id, username, role FROM users ORDER BY id");
+    res.json({ ok: true, users: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// PATCH /api/users/:id/role — changer le rôle d'un utilisateur
+app.patch("/api/users/:id/role", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { role } = req.body || {};
+    const userId = Number(req.params.id);
+
+    if (!["admin", "user"].includes(role)) {
+      return res.status(400).json({ ok: false, error: "Rôle invalide (admin ou user)" });
+    }
+
+    // Empêcher de se rétrograder soi-même
+    if (userId === req.user.id && role !== "admin") {
+      return res.status(400).json({ ok: false, error: "Tu ne peux pas te rétrograder toi-même" });
+    }
+
+    await dbQuery("UPDATE users SET role = ? WHERE id = ?", [role, userId]);
+    console.log(`[USERS] Rôle de user #${userId} changé → ${role}`);
+    res.json({ ok: true, message: `Rôle mis à jour → ${role}` });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// DELETE /api/users/:id — supprimer un utilisateur
+app.delete("/api/users/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+
+    // Empêcher de se supprimer soi-même
+    if (userId === req.user.id) {
+      return res.status(400).json({ ok: false, error: "Tu ne peux pas supprimer ton propre compte" });
+    }
+
+    await dbQuery("DELETE FROM users WHERE id = ?", [userId]);
+    console.log(`[USERS] User #${userId} supprimé`);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -868,7 +928,7 @@ app.get("/rfid", requireAuth, async (req, res) => {
 });
 
 // POST /rfid — ajouter un badge
-app.post("/rfid", requireAuth, async (req, res) => {
+app.post("/rfid", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { uid, owner, enabled } = req.body || {};
     if (!uid) return res.status(400).json({ ok: false, error: "UID requis" });
@@ -886,7 +946,7 @@ app.post("/rfid", requireAuth, async (req, res) => {
 });
 
 // PATCH /rfid/:id — activer/désactiver un badge
-app.patch("/rfid/:id", requireAuth, async (req, res) => {
+app.patch("/rfid/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const { enabled } = req.body || {};
     const id = req.params.id;
@@ -904,7 +964,7 @@ app.patch("/rfid/:id", requireAuth, async (req, res) => {
 });
 
 // DELETE /rfid/:id — supprimer un badge
-app.delete("/rfid/:id", requireAuth, async (req, res) => {
+app.delete("/rfid/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const isNum = /^\d+$/.test(id);
@@ -1087,7 +1147,7 @@ app.post("/rfid/scan", async (req, res) => {
 // ── RFID ENROLLMENT (détection automatique) ──
 
 // POST /rfid/enroll/start — active le mode enrollment pour 60s
-app.post("/rfid/enroll/start", requireAuth, (req, res) => {
+app.post("/rfid/enroll/start", requireAuth, requireAdmin, (req, res) => {
   const duration = 60000; // 60 secondes
   enrollMode.active = true;
   enrollMode.startedAt = Date.now();
@@ -1127,7 +1187,7 @@ app.get("/rfid/enroll/status", requireAuth, (req, res) => {
 });
 
 // POST /rfid/enroll/stop — arrêter manuellement l'enrollment
-app.post("/rfid/enroll/stop", requireAuth, (req, res) => {
+app.post("/rfid/enroll/stop", requireAuth, requireAdmin, (req, res) => {
   enrollMode.active = false;
   console.log("[RFID] Mode enrollment arrêté manuellement");
   res.json({ ok: true, detected_uid: enrollMode.detectedUid });
@@ -1208,7 +1268,7 @@ function stopRecording() {
 }
 
 // POST /api/cam/record/start — lancer l'enregistrement
-app.post("/api/cam/record/start", requireAuth, (req, res) => {
+app.post("/api/cam/record/start", requireAuth, requireAdmin, (req, res) => {
   const result = startRecording("manual");
   if (!result.ok) {
     return res.status(400).json({ ok: false, error: result.reason });
@@ -1217,7 +1277,7 @@ app.post("/api/cam/record/start", requireAuth, (req, res) => {
 });
 
 // POST /api/cam/record/stop — arrêter l'enregistrement
-app.post("/api/cam/record/stop", requireAuth, (req, res) => {
+app.post("/api/cam/record/stop", requireAuth, requireAdmin, (req, res) => {
   const result = stopRecording();
   if (!result.ok) {
     return res.status(400).json({ ok: false, error: result.reason });
