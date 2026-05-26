@@ -13,8 +13,11 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Servir les fichiers statiques (dashboard.html, .css, .js)
+app.use(express.static("/var/www/html"));
+
 // ─── CONFIG ─────────────────────────────────────────────────
-const PORT = Number(process.env.PORT);
+const PORT = Number(process.env.PORT || 80);
 const JWT_SECRET = process.env.JWT_SECRET;
 
 // MySQL
@@ -45,6 +48,251 @@ const TEST_DELAY_DEFAULT = 1200;
 // Enregistrement caméra
 const RTSP_URL = process.env.RTSP_URL || "";
 const RECORDINGS_PATH = process.env.RECORDINGS_PATH || "/sftp/camciel1/upload";
+
+// ─── CAMÉRAS (multi-cam) ────────────────────────────────────
+// Construit la liste des caméras depuis les variables CAMn_*
+function loadCameras() {
+  const cams = [];
+  for (let i = 1; i <= 8; i++) {
+    const main = process.env[`CAM${i}_RTSP_MAIN`];
+    const sub = process.env[`CAM${i}_RTSP_SUB`];
+    if (!main && !sub) continue;
+    cams.push({
+      id: `cam${i}`,
+      index: i,
+      name: process.env[`CAM${i}_NAME`] || `Caméra ${i}`,
+      type: process.env[`CAM${i}_TYPE`] || "generic",
+      rtsp_main: main || "",
+      rtsp_sub: sub || "",
+      // URLs HLS publiques (servies par Apache ou static Express)
+      hls_main: `/cam/cam${i}/main/live.m3u8`,
+      hls_sub: `/cam/cam${i}/sub/live.m3u8`,
+    });
+  }
+  // Fallback : si aucune CAMn_* mais RTSP_URL existe (ancien setup), expose cam1
+  if (!cams.length && RTSP_URL) {
+    cams.push({
+      id: "cam1", index: 1, name: "Caméra principale", type: "dahua",
+      rtsp_main: RTSP_URL, rtsp_sub: "",
+      hls_main: "/cam/main/live.m3u8", hls_sub: "/cam/sub/live.m3u8",
+    });
+  }
+  return cams;
+}
+const CAMERAS = loadCameras();
+const ALARM_REC_CAM = `cam${Number(process.env.ALARM_REC_CAM || 1)}`;
+
+function getCamById(id) {
+  return CAMERAS.find(c => c.id === id) || null;
+}
+
+// ─── PIPELINE HLS (RTSP → HLS via FFmpeg) ──────────────────
+// Spawn 1 process FFmpeg par cam × qualité, surveille et relance si crash.
+// Active uniquement si HLS_ENABLE=true dans .env (pour pouvoir désactiver
+// si un autre service gère déjà le HLS sur ce serveur).
+
+const HLS_ENABLE = (process.env.HLS_ENABLE || "true").toLowerCase() !== "false";
+const HLS_OUTPUT_PATH = process.env.HLS_OUTPUT_PATH || "/var/www/html/cam";
+const HLS_SEGMENT_DURATION = Number(process.env.HLS_SEGMENT_DURATION || 2);
+const HLS_LIST_SIZE = Number(process.env.HLS_LIST_SIZE || 4);
+
+// État interne : { "cam1:main": { process, restartCount, lastStart, killed } }
+const hlsStreams = {};
+
+function startHlsStream(camId, quality, rtspUrl) {
+  if (!rtspUrl) return;
+  const key = `${camId}:${quality}`;
+  const outDir = path.join(HLS_OUTPUT_PATH, camId, quality);
+
+  try {
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+  } catch (e) {
+    console.error(`[HLS ${key}] Impossible de créer ${outDir}:`, e.message);
+    return;
+  }
+
+  // Mode HLS configurable par cam via CAMn_HLS_MODE (default: copy)
+  // - copy        : H.264 → segments .ts (le plus léger CPU, le plus compatible)
+  // - copy_fmp4   : HEVC/H.265 → segments .m4s en fMP4 (léger CPU, navigateurs modernes)
+  // - h264        : transcode tout vers H.264 (universel, mais coûte du CPU)
+  const cam = getCamById(camId);
+  const camIdx = cam ? cam.index : 1;
+  const mode = (process.env[`CAM${camIdx}_HLS_MODE`] || "copy").toLowerCase();
+
+  let codecArgs, formatArgs;
+  if (mode === "copy_fmp4") {
+    // HEVC en HLS fMP4 (pas de re-encoding)
+    codecArgs = ["-c:v", "copy", "-c:a", "aac"];
+    formatArgs = [
+      "-f", "hls",
+      "-hls_time", String(HLS_SEGMENT_DURATION),
+      "-hls_list_size", String(HLS_LIST_SIZE),
+      "-hls_flags", "delete_segments+omit_endlist+independent_segments",
+      "-hls_segment_type", "fmp4",
+      "-hls_fmp4_init_filename", "init.mp4",
+      "-hls_segment_filename", path.join(outDir, "seg_%05d.m4s"),
+    ];
+  } else if (mode === "h264") {
+    // Transcode H.265 (ou autre) → H.264 dans des .ts (universel)
+    codecArgs = [
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-tune", "zerolatency",
+      "-c:a", "aac",
+    ];
+    formatArgs = [
+      "-f", "hls",
+      "-hls_time", String(HLS_SEGMENT_DURATION),
+      "-hls_list_size", String(HLS_LIST_SIZE),
+      "-hls_flags", "delete_segments+omit_endlist",
+      "-hls_segment_filename", path.join(outDir, "seg_%05d.ts"),
+    ];
+  } else {
+    // copy (défaut) : H.264 directement en .ts
+    codecArgs = ["-c:v", "copy", "-c:a", "aac"];
+    formatArgs = [
+      "-f", "hls",
+      "-hls_time", String(HLS_SEGMENT_DURATION),
+      "-hls_list_size", String(HLS_LIST_SIZE),
+      "-hls_flags", "delete_segments+omit_endlist",
+      "-hls_segment_filename", path.join(outDir, "seg_%05d.ts"),
+    ];
+  }
+
+  const args = [
+    "-hide_banner", "-loglevel", "warning",
+    "-rtsp_transport", "tcp",
+    "-i", rtspUrl,
+    ...codecArgs,
+    ...formatArgs,
+    path.join(outDir, "live.m3u8"),
+  ];
+
+  console.log(`[HLS ${key}] mode=${mode}`);
+  const proc = spawn("ffmpeg", args);
+  const state = hlsStreams[key] || { restartCount: 0 };
+  state.process = proc;
+  state.lastStart = Date.now();
+  state.killed = false;
+  state.outDir = outDir;
+  hlsStreams[key] = state;
+
+  // Garde les ~20 dernières lignes de stderr pour les afficher si FFmpeg crash
+  state.stderrBuffer = state.stderrBuffer || [];
+  proc.stderr.on("data", (chunk) => {
+    const lines = chunk.toString().split(/\r?\n/).filter(l => l.trim());
+    for (const line of lines) {
+      state.stderrBuffer.push(line);
+      if (state.stderrBuffer.length > 20) state.stderrBuffer.shift();
+    }
+  });
+
+  proc.on("error", (err) => {
+    console.error(`[HLS ${key}] erreur spawn:`, err.message);
+  });
+
+  proc.on("close", (code) => {
+    state.process = null;
+    if (state.killed) {
+      console.log(`[HLS ${key}] arrêté (code ${code})`);
+      return;
+    }
+    // Crash : afficher les dernières lignes stderr pour comprendre pourquoi
+    if (code !== 0 && state.stderrBuffer && state.stderrBuffer.length) {
+      console.warn(`[HLS ${key}] ─── stderr FFmpeg (dernières lignes) ───`);
+      for (const line of state.stderrBuffer) {
+        console.warn(`[HLS ${key}]   ${line}`);
+      }
+      console.warn(`[HLS ${key}] ──────────────────────────────────────────`);
+      state.stderrBuffer = []; // reset pour le prochain crash
+    }
+
+    state.restartCount++;
+    const delay = Math.min(30000, 2000 + state.restartCount * 1000);
+    console.warn(`[HLS ${key}] FFmpeg s'est arrêté (code ${code}) — relance dans ${delay}ms (essai #${state.restartCount})`);
+    setTimeout(() => {
+      if (!state.killed) startHlsStream(camId, quality, rtspUrl);
+    }, delay);
+  });
+
+  // Masque le mot de passe RTSP dans le log au démarrage
+  const safeUrl = rtspUrl.replace(/(rtsp:\/\/[^:]+:)[^@]+(@)/, "$1***$2");
+  console.log(`[HLS ${key}] FFmpeg démarré → ${outDir}/live.m3u8 (source: ${safeUrl})`);
+}
+
+function stopAllHlsStreams() {
+  for (const [key, state] of Object.entries(hlsStreams)) {
+    state.killed = true;
+    if (state.process) {
+      try { state.process.kill("SIGINT"); } catch {}
+    }
+    console.log(`[HLS ${key}] kill envoyé`);
+  }
+}
+
+function startAllHlsStreams() {
+  if (!HLS_ENABLE) {
+    console.log("[HLS] désactivé via HLS_ENABLE=false");
+    return;
+  }
+  if (!CAMERAS.length) {
+    console.log("[HLS] aucune caméra configurée, rien à démarrer");
+    return;
+  }
+
+  // Crée le dossier racine + symlinks de rétrocompat
+  try {
+    if (!fs.existsSync(HLS_OUTPUT_PATH)) fs.mkdirSync(HLS_OUTPUT_PATH, { recursive: true });
+
+    // Symlinks /cam/main → /cam/cam1/main et /cam/sub → /cam/cam1/sub
+    // (pour que les anciens clients qui appellent /cam/sub/live.m3u8 continuent à marcher)
+    const cam1 = getCamById("cam1");
+    if (cam1) {
+      const links = [
+        { from: path.join(HLS_OUTPUT_PATH, "main"), to: path.join(HLS_OUTPUT_PATH, "cam1", "main") },
+        { from: path.join(HLS_OUTPUT_PATH, "sub"),  to: path.join(HLS_OUTPUT_PATH, "cam1", "sub") },
+      ];
+      for (const { from, to } of links) {
+        try {
+          // Crée la cible si elle n'existe pas encore (FFmpeg le fera aussi mais autant être propre)
+          fs.mkdirSync(to, { recursive: true });
+          // Si "from" existe déjà comme dossier réel (ancien setup), on n'écrase pas
+          if (fs.existsSync(from)) {
+            const stat = fs.lstatSync(from);
+            if (!stat.isSymbolicLink()) {
+              console.warn(`[HLS] ${from} existe déjà comme vrai dossier, symlink ignoré`);
+              continue;
+            }
+            fs.unlinkSync(from);
+          }
+          fs.symlinkSync(to, from);
+        } catch (e) {
+          console.warn(`[HLS] symlink ${from} → ${to} : ${e.message}`);
+        }
+      }
+    }
+  } catch (e) {
+    console.error("[HLS] préparation dossiers:", e.message);
+  }
+
+  console.log(`[HLS] Démarrage des flux pour ${CAMERAS.length} cam(s) → ${HLS_OUTPUT_PATH}`);
+  for (const cam of CAMERAS) {
+    if (cam.rtsp_main) startHlsStream(cam.id, "main", cam.rtsp_main);
+    if (cam.rtsp_sub)  startHlsStream(cam.id, "sub",  cam.rtsp_sub);
+  }
+}
+
+// Arrêter proprement les FFmpeg quand le serveur s'arrête
+function gracefulShutdown(signal) {
+  console.log(`\n[HLS] Signal ${signal} reçu, arrêt des flux FFmpeg…`);
+  stopAllHlsStreams();
+  setTimeout(() => process.exit(0), 1000); // laisse le temps aux kill de partir
+}
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+// Route admin pour redémarrer manuellement un flux HLS (utile pour debug)
+// (à mettre à la fin avec les autres routes mais on la déclare ici pour la cohérence)
 
 // ─── MAPPING DI / DO / ZONES ────────────────────────────────
 
@@ -115,19 +363,61 @@ function requireAdmin(req, res, next) {
 
 // ─── Register / Login ───────────────────────────────────────
 app.post("/register", (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) {
-    return res.status(400).json({ success: false, message: "Données manquantes" });
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: "Vous devez être connecté avec un compte administrateur pour créer un compte."
+    });
   }
-  const hashedPassword = bcrypt.hashSync(password, 10);
-  db.query(
-    "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-    [username, hashedPassword, "user"],
-    (err) => {
-      if (err) return res.status(500).json({ success: false, message: "Nom d'utilisateur déjà utilisé (ou erreur DB)" });
-      return res.json({ success: true, message: "Compte créé" });
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({
+        success: false,
+        message: "Session invalide ou expirée."
+      });
     }
-  );
+
+    // Vérification du rôle admin
+    if (!decoded.role || decoded.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Accès refusé : seul un administrateur peut créer un compte."
+      });
+    }
+
+    const { username, password } = req.body || {};
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Données manquantes"
+      });
+    }
+
+    const hashedPassword = bcrypt.hashSync(password, 10);
+
+    db.query(
+      "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+      [username, hashedPassword, "user"],
+      (err) => {
+        if (err) {
+          return res.status(500).json({
+            success: false,
+            message: "Nom d'utilisateur déjà utilisé (ou erreur DB)"
+          });
+        }
+
+        return res.json({
+          success: true,
+          message: "Compte créé"
+        });
+      }
+    );
+  });
 });
 
 app.post("/login", (req, res) => {
@@ -454,8 +744,9 @@ async function disarmAlarm() {
   alarmTriggerInfo = null;
 
   // Arrêter l'enregistrement automatique s'il est en cours
-  if (recordingAutoAlarm && recordingProcess) {
-    stopRecording();
+  const autoRec = recordings[ALARM_REC_CAM];
+  if (autoRec && autoRec.autoAlarm) {
+    stopRecording(ALARM_REC_CAM);
     console.log("🔓 Enregistrement alarme arrêté automatiquement");
   }
 
@@ -1193,17 +1484,21 @@ app.post("/rfid/enroll/stop", requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true, detected_uid: enrollMode.detectedUid });
 });
 
-// ─── ENREGISTREMENT CAMÉRA (FFmpeg) ────────────────────────
+// ─── ENREGISTREMENT CAMÉRA (FFmpeg, multi-cam) ─────────────
+//
+// Stocke un état d'enregistrement par cam (id). Plusieurs cams peuvent
+// enregistrer en parallèle. L'ancienne API mono-cam (sans cam_id) cible
+// ALARM_REC_CAM par défaut → rétrocompatible avec le frontend existant.
 
-let recordingProcess = null;
-let recordingStartTime = null;
-let recordingFilename = null;
-let recordingAutoAlarm = false; // true si lancé automatiquement par l'alarme
+const recordings = {}; // { [camId]: { process, startTime, filename, autoAlarm } }
 
-// Fonction utilitaire : démarrer un enregistrement
-function startRecording(source = "manual") {
-  if (recordingProcess) return { ok: false, reason: "already_recording" };
-  if (!RTSP_URL) return { ok: false, reason: "no_rtsp_url" };
+function startRecording(source = "manual", camId = ALARM_REC_CAM) {
+  const cam = getCamById(camId);
+  if (!cam) return { ok: false, reason: "unknown_cam" };
+  if (recordings[camId]) return { ok: false, reason: "already_recording" };
+
+  const rtspUrl = cam.rtsp_main || RTSP_URL; // fallback ancien setup
+  if (!rtspUrl) return { ok: false, reason: "no_rtsp_url" };
 
   try {
     if (!fs.existsSync(RECORDINGS_PATH)) {
@@ -1217,87 +1512,113 @@ function startRecording(source = "manual") {
   const now = new Date();
   const ts = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const prefix = source === "alarm" ? "alarme" : "rec";
-  recordingFilename = `${prefix}_${ts}.mp4`;
-  const filepath = path.join(RECORDINGS_PATH, recordingFilename);
+  const filename = `${prefix}_${camId}_${ts}.mp4`;
+  const filepath = path.join(RECORDINGS_PATH, filename);
 
-  recordingProcess = spawn("ffmpeg", [
+  const proc = spawn("ffmpeg", [
     "-rtsp_transport", "tcp",
-    "-i", RTSP_URL,
+    "-i", rtspUrl,
     "-c:v", "copy",
     "-c:a", "aac",
     "-y",
     filepath,
   ]);
 
-  recordingStartTime = Date.now();
-  recordingAutoAlarm = (source === "alarm");
+  const state = {
+    process: proc,
+    startTime: Date.now(),
+    filename,
+    autoAlarm: source === "alarm",
+    camId,
+  };
+  recordings[camId] = state;
 
-  recordingProcess.stderr.on("data", () => {});
+  proc.stderr.on("data", () => {});
 
-  recordingProcess.on("error", (err) => {
-    console.error("[REC] Erreur FFmpeg:", err.message);
-    recordingProcess = null;
-    recordingStartTime = null;
-    recordingFilename = null;
-    recordingAutoAlarm = false;
+  proc.on("error", (err) => {
+    console.error(`[REC ${camId}] Erreur FFmpeg:`, err.message);
+    delete recordings[camId];
   });
 
-  recordingProcess.on("close", (code) => {
-    console.log(`[REC] FFmpeg terminé (code ${code}) — ${recordingFilename}`);
-    recordingProcess = null;
-    recordingStartTime = null;
-    recordingFilename = null;
-    recordingAutoAlarm = false;
+  proc.on("close", (code) => {
+    console.log(`[REC ${camId}] FFmpeg terminé (code ${code}) — ${filename}`);
+    delete recordings[camId];
   });
 
-  console.log(`[REC] ⏺ Enregistrement démarré (${source}) → ${filepath}`);
-  return { ok: true, filename: recordingFilename, path: filepath };
+  console.log(`[REC ${camId}] ⏺ Enregistrement démarré (${source}) → ${filepath}`);
+  return { ok: true, cam_id: camId, filename, path: filepath };
 }
 
-// Fonction utilitaire : arrêter l'enregistrement
-function stopRecording() {
-  if (!recordingProcess) return { ok: false, reason: "not_recording" };
+function stopRecording(camId = ALARM_REC_CAM) {
+  const state = recordings[camId];
+  if (!state) return { ok: false, reason: "not_recording" };
 
-  const filename = recordingFilename;
-  const duration = Math.round((Date.now() - recordingStartTime) / 1000);
+  const filename = state.filename;
+  const duration = Math.round((Date.now() - state.startTime) / 1000);
+  state.process.kill("SIGINT");
 
-  recordingProcess.kill("SIGINT");
-
-  console.log(`[REC] ⏹ Enregistrement arrêté — ${filename} (${duration}s)`);
-  return { ok: true, filename, duration_seconds: duration };
+  console.log(`[REC ${camId}] ⏹ Enregistrement arrêté — ${filename} (${duration}s)`);
+  return { ok: true, cam_id: camId, filename, duration_seconds: duration };
 }
 
-// POST /api/cam/record/start — lancer l'enregistrement
+// GET /api/cam/list — config des caméras pour le frontend
+app.get("/api/cam/list", requireAuth, (req, res) => {
+  // On expose les infos publiques uniquement (pas les URLs RTSP avec credentials)
+  const list = CAMERAS.map(c => ({
+    id: c.id,
+    index: c.index,
+    name: c.name,
+    type: c.type,
+    hls_main: c.hls_main,
+    hls_sub: c.hls_sub,
+  }));
+  res.json({ ok: true, cameras: list, alarm_rec_cam: ALARM_REC_CAM });
+});
+
+// POST /api/cam/record/start — body optionnel { cam_id: "cam2" }
 app.post("/api/cam/record/start", requireAuth, requireAdmin, (req, res) => {
-  const result = startRecording("manual");
-  if (!result.ok) {
-    return res.status(400).json({ ok: false, error: result.reason });
-  }
+  const camId = (req.body && req.body.cam_id) || ALARM_REC_CAM;
+  const result = startRecording("manual", camId);
+  if (!result.ok) return res.status(400).json({ ok: false, error: result.reason });
   res.json(result);
 });
 
-// POST /api/cam/record/stop — arrêter l'enregistrement
+// POST /api/cam/record/stop — body optionnel { cam_id: "cam2" }
 app.post("/api/cam/record/stop", requireAuth, requireAdmin, (req, res) => {
-  const result = stopRecording();
-  if (!result.ok) {
-    return res.status(400).json({ ok: false, error: result.reason });
-  }
+  const camId = (req.body && req.body.cam_id) || ALARM_REC_CAM;
+  const result = stopRecording(camId);
+  if (!result.ok) return res.status(400).json({ ok: false, error: result.reason });
   res.json(result);
 });
 
-// GET /api/cam/record/status — état de l'enregistrement
+// GET /api/cam/record/status — état global de tous les enregistrements
+// Rétrocompat : champs racine (recording, filename, elapsed_seconds, auto_alarm)
+// reflètent l'enregistrement de la cam d'alarme (cam par défaut).
 app.get("/api/cam/record/status", requireAuth, (req, res) => {
-  if (!recordingProcess || !recordingStartTime) {
-    return res.json({ ok: true, recording: false });
+  const byCam = {};
+  for (const [camId, st] of Object.entries(recordings)) {
+    byCam[camId] = {
+      recording: true,
+      filename: st.filename,
+      elapsed_seconds: Math.round((Date.now() - st.startTime) / 1000),
+      auto_alarm: st.autoAlarm,
+    };
   }
 
-  const elapsed = Math.round((Date.now() - recordingStartTime) / 1000);
+  // Rétrocompat champs racine
+  const defaultSt = recordings[ALARM_REC_CAM];
+  if (!defaultSt) {
+    return res.json({ ok: true, recording: false, by_cam: byCam });
+  }
+
+  const elapsed = Math.round((Date.now() - defaultSt.startTime) / 1000);
   res.json({
     ok: true,
     recording: true,
-    filename: recordingFilename,
+    filename: defaultSt.filename,
     elapsed_seconds: elapsed,
-    auto_alarm: recordingAutoAlarm,
+    auto_alarm: defaultSt.autoAlarm,
+    by_cam: byCam,
   });
 });
 
@@ -1320,10 +1641,45 @@ app.get("/api/cam/recordings", requireAuth, (req, res) => {
   }
 });
 
+// GET /api/cam/hls/status — état des flux HLS (admin)
+app.get("/api/cam/hls/status", requireAuth, requireAdmin, (req, res) => {
+  const streams = Object.entries(hlsStreams).map(([key, st]) => ({
+    key,
+    running: !!st.process,
+    restart_count: st.restartCount || 0,
+    uptime_seconds: st.lastStart ? Math.round((Date.now() - st.lastStart) / 1000) : 0,
+    out_dir: st.outDir,
+  }));
+  res.json({ ok: true, enabled: HLS_ENABLE, streams });
+});
+
+// POST /api/cam/hls/restart — relancer un flux (body: { cam_id, quality })
+app.post("/api/cam/hls/restart", requireAuth, requireAdmin, (req, res) => {
+  const camId = req.body && req.body.cam_id;
+  const quality = (req.body && req.body.quality) || "sub";
+  const cam = getCamById(camId);
+  if (!cam) return res.status(400).json({ ok: false, error: "unknown_cam" });
+  const rtspUrl = quality === "main" ? cam.rtsp_main : cam.rtsp_sub;
+  if (!rtspUrl) return res.status(400).json({ ok: false, error: "no_rtsp_url" });
+
+  const key = `${camId}:${quality}`;
+  const existing = hlsStreams[key];
+  if (existing && existing.process) {
+    existing.killed = true;
+    try { existing.process.kill("SIGINT"); } catch {}
+  }
+  // Petit délai pour que FFmpeg libère le fichier .m3u8, puis relance
+  setTimeout(() => startHlsStream(camId, quality, rtspUrl), 500);
+  res.json({ ok: true, restarted: key });
+});
+
 // ─── DÉMARRAGE ──────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`adjudicator.js lancé sur le port ${PORT}`);
   console.log(`PET-DO: ${PET_DO_IP}:${PET_DO_PORT} (unit ${PET_DO_UNIT})`);
   console.log(`PET-DI: ${PET_DI_IP}:${PET_DI_PORT} (unit ${PET_DI_UNIT})`);
+  console.log(`Caméras configurées : ${CAMERAS.length} (alarme → ${ALARM_REC_CAM})`);
+  CAMERAS.forEach(c => console.log(`  - ${c.id} : ${c.name} (${c.type})`));
   startPolling();
+  startAllHlsStreams();
 });
