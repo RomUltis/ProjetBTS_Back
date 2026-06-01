@@ -13,8 +13,18 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Servir les fichiers statiques (dashboard.html, .css, .js)
+// Servir les fichiers statiques du frontend (dashboard.html, .css, .js, login.html…)
+// On utilise un setHeaders qui n'intervient PAS sur le contenu (pas de res.end ici,
+// ça casserait la réponse). Le middleware juste après bloque /cam/ proprement.
 app.use(express.static("/var/www/html"));
+
+// ─── Garde-fou RGPD : /cam/* ne doit JAMAIS être servi par le static ───
+// Si une requête /cam/* arrive jusqu'ici, c'est qu'express.static n'a pas
+// trouvé le fichier (parce que le dossier a été nettoyé : bon).
+// Le routage continue vers app.get("/cam/*") déclaré plus bas, qui applique
+// la vérification JWT + état armé.
+// Si toutefois le dossier traîne encore et qu'express.static a servi un fichier,
+// la réponse est déjà partie : nettoie /var/www/html/cam/ après migration !
 
 // ─── CONFIG ─────────────────────────────────────────────────
 const PORT = Number(process.env.PORT || 80);
@@ -92,9 +102,27 @@ function getCamById(id) {
 // si un autre service gère déjà le HLS sur ce serveur).
 
 const HLS_ENABLE = (process.env.HLS_ENABLE || "true").toLowerCase() !== "false";
-const HLS_OUTPUT_PATH = process.env.HLS_OUTPUT_PATH || "/var/www/html/cam";
+// IMPORTANT RGPD : chemin privé par défaut (hors zone publique web)
+const HLS_OUTPUT_PATH = process.env.HLS_OUTPUT_PATH || "/var/lib/alarme/hls";
 const HLS_SEGMENT_DURATION = Number(process.env.HLS_SEGMENT_DURATION || 2);
 const HLS_LIST_SIZE = Number(process.env.HLS_LIST_SIZE || 4);
+
+// ─── CONFORMITÉ RGPD ────────────────────────────────────────
+// Quand RGPD_CAMS_ONLY_WHEN_ARMED=true (recommandé) :
+//   - les flux HLS ne tournent QUE quand l'alarme est armée
+//   - dès le désarmement, FFmpeg est tué + segments effacés du disque
+//   - les routes /cam/* renvoient 403 quand alarme désarmée
+// Conforme à :
+//   - RGPD art. 5.1.c (minimisation des données)
+//   - RGPD art. 5.1.e (limitation de la conservation)
+//   - Doctrine CNIL — fiche établissements scolaires du 12/09/2025
+const RGPD_CAMS_ONLY_WHEN_ARMED = (process.env.RGPD_CAMS_ONLY_WHEN_ARMED || "true").toLowerCase() !== "false";
+
+// Cache du dernier état armé connu (mis à jour par arm()/disarm()).
+// Évite de relire la BDD à chaque requête /cam/*.
+let _alarmIsArmed = false;
+function isAlarmArmedCached() { return _alarmIsArmed; }
+function setAlarmArmedCache(value) { _alarmIsArmed = !!value; }
 
 // État interne : { "cam1:main": { process, restartCount, lastStart, killed } }
 const hlsStreams = {};
@@ -230,6 +258,42 @@ function stopAllHlsStreams() {
   }
 }
 
+/**
+ * RGPD — Supprime physiquement tous les segments HLS écrits sur disque.
+ * Appelé après stopAllHlsStreams() pour ne laisser AUCUNE image résiduelle
+ * (conformité art. 5.1.c et 5.1.e du RGPD).
+ *
+ * On supprime uniquement le CONTENU des dossiers cam/main et cam/sub, pas
+ * les dossiers eux-mêmes (FFmpeg les recréera vides au prochain arm()).
+ */
+function purgeAllHlsSegments() {
+  let deletedFiles = 0;
+  for (const cam of CAMERAS) {
+    for (const quality of ["main", "sub"]) {
+      const dir = path.join(HLS_OUTPUT_PATH, cam.id, quality);
+      if (!fs.existsSync(dir)) continue;
+      try {
+        const files = fs.readdirSync(dir);
+        for (const f of files) {
+          // Supprime .m3u8, .ts, .m4s, init.mp4 — bref tout ce qui pourrait
+          // contenir des données d'image
+          if (/\.(m3u8|ts|m4s|mp4)$/.test(f)) {
+            try {
+              fs.unlinkSync(path.join(dir, f));
+              deletedFiles++;
+            } catch {}
+          }
+        }
+      } catch (e) {
+        console.error(`[HLS] purge ${dir} error:`, e.message);
+      }
+    }
+  }
+  if (deletedFiles > 0) {
+    console.log(`[RGPD] 🗑 ${deletedFiles} segment(s) HLS supprimé(s) du disque (conformité art. 5.1.c)`);
+  }
+}
+
 function startAllHlsStreams() {
   if (!HLS_ENABLE) {
     console.log("[HLS] désactivé via HLS_ENABLE=false");
@@ -240,39 +304,23 @@ function startAllHlsStreams() {
     return;
   }
 
-  // Crée le dossier racine + symlinks de rétrocompat
+  // ─── Préparation des dossiers ─────────────────────────────
   try {
     if (!fs.existsSync(HLS_OUTPUT_PATH)) fs.mkdirSync(HLS_OUTPUT_PATH, { recursive: true });
 
-    // Symlinks /cam/main → /cam/cam1/main et /cam/sub → /cam/cam1/sub
-    // (pour que les anciens clients qui appellent /cam/sub/live.m3u8 continuent à marcher)
-    const cam1 = getCamById("cam1");
-    if (cam1) {
-      const links = [
-        { from: path.join(HLS_OUTPUT_PATH, "main"), to: path.join(HLS_OUTPUT_PATH, "cam1", "main") },
-        { from: path.join(HLS_OUTPUT_PATH, "sub"),  to: path.join(HLS_OUTPUT_PATH, "cam1", "sub") },
-      ];
-      for (const { from, to } of links) {
-        try {
-          // Crée la cible si elle n'existe pas encore (FFmpeg le fera aussi mais autant être propre)
-          fs.mkdirSync(to, { recursive: true });
-          // Si "from" existe déjà comme dossier réel (ancien setup), on n'écrase pas
-          if (fs.existsSync(from)) {
-            const stat = fs.lstatSync(from);
-            if (!stat.isSymbolicLink()) {
-              console.warn(`[HLS] ${from} existe déjà comme vrai dossier, symlink ignoré`);
-              continue;
-            }
-            fs.unlinkSync(from);
-          }
-          fs.symlinkSync(to, from);
-        } catch (e) {
-          console.warn(`[HLS] symlink ${from} → ${to} : ${e.message}`);
-        }
-      }
-    }
+    // Note RGPD : on a supprimé les anciens symlinks /cam/main → /cam/cam1/main
+    // qui pointaient sur /var/www/html. Désormais tout passe par notre route
+    // authentifiée /cam/* (voir plus bas).
   } catch (e) {
     console.error("[HLS] préparation dossiers:", e.message);
+  }
+
+  // ─── Démarrage conditionnel des flux ──────────────────────
+  // RGPD : si le mode "cams only when armed" est actif, on ne démarre RIEN au boot.
+  // Les flux seront démarrés à l'arm() suivant.
+  if (RGPD_CAMS_ONLY_WHEN_ARMED && !isAlarmArmedCached()) {
+    console.log(`[HLS] 🛡 RGPD : flux non démarrés (alarme désarmée). Démarrage à l'arm().`);
+    return;
   }
 
   console.log(`[HLS] Démarrage des flux pour ${CAMERAS.length} cam(s) → ${HLS_OUTPUT_PATH}`);
@@ -354,12 +402,111 @@ function requireAuth(req, res, next) {
   }
 }
 
+/**
+ * Variante de requireAuth pour les flux HLS.
+ * HLS.js peut envoyer des headers (xhrSetup), mais le tag <video> natif (Safari iOS)
+ * ne le peut pas. Pour rester compatible, on accepte 3 sources de token, dans l'ordre :
+ *   1. Header Authorization: Bearer xxx  (utilisé par HLS.js via xhrSetup)
+ *   2. Query string ?token=xxx           (fallback navigateur natif)
+ *   3. Cookie alarme_token=xxx           (fallback)
+ *
+ * Le frontend pose le token dans les 3 endroits après login.
+ */
+function requireAuthFlexible(req, res, next) {
+  let token = null;
+
+  // 1. Header Authorization
+  const authHeader = req.headers.authorization || "";
+  const parts = authHeader.split(" ");
+  if (parts.length === 2 && parts[0] === "Bearer") {
+    token = parts[1];
+  }
+
+  // 2. Query string
+  if (!token && req.query && req.query.token) {
+    token = req.query.token;
+  }
+
+  // 3. Cookie
+  if (!token && req.headers.cookie) {
+    const match = req.headers.cookie.match(/(?:^|; )alarme_token=([^;]+)/);
+    if (match) token = decodeURIComponent(match[1]);
+  }
+
+  if (!token) {
+    return res.status(401).json({ ok: false, error: "Token manquant" });
+  }
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    return next();
+  } catch {
+    return res.status(401).json({ ok: false, error: "Token invalide" });
+  }
+}
+
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== "admin") {
     return res.status(403).json({ ok: false, error: "Accès réservé aux administrateurs" });
   }
   return next();
 }
+
+// ─── ROUTE /cam/* : flux HLS sécurisés (RGPD) ───────────────
+//
+// Sert les fichiers HLS depuis HLS_OUTPUT_PATH (dossier privé) après :
+//   1. Vérification JWT (token dans header, query, ou cookie)
+//   2. Vérification que l'alarme est armée si RGPD_CAMS_ONLY_WHEN_ARMED=true
+//
+// Réponses possibles :
+//   200 + fichier  → tout va bien
+//   401            → pas de token / token invalide
+//   403            → alarme désarmée (refus RGPD)
+//   404            → fichier inexistant
+app.get("/cam/*", requireAuthFlexible, (req, res) => {
+  // Check RGPD : alarme doit être armée
+  if (RGPD_CAMS_ONLY_WHEN_ARMED && !isAlarmArmedCached()) {
+    return res.status(403).json({
+      ok: false,
+      error: "rgpd_disabled",
+      message: "Caméras désactivées conformément au RGPD (art. 5.1.c). Activation lors de l'armement de l'alarme.",
+    });
+  }
+
+  // Récupère le chemin relatif après /cam/ (ex: "cam1/sub/live.m3u8")
+  const relativePath = req.path.slice("/cam/".length);
+
+  // Sécurité : empêche les path traversal (../../../etc/passwd)
+  if (relativePath.includes("..") || relativePath.startsWith("/")) {
+    return res.status(400).json({ ok: false, error: "Chemin invalide" });
+  }
+
+  const filepath = path.join(HLS_OUTPUT_PATH, relativePath);
+
+  // Sécurité supplémentaire : on vérifie que le chemin résolu est bien dans HLS_OUTPUT_PATH
+  const resolved = path.resolve(filepath);
+  if (!resolved.startsWith(path.resolve(HLS_OUTPUT_PATH))) {
+    return res.status(400).json({ ok: false, error: "Chemin invalide" });
+  }
+
+  // Headers anti-cache (les flux live ne doivent jamais être cachés)
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.setHeader("Pragma", "no-cache");
+
+  // Content-Type adapté
+  if (filepath.endsWith(".m3u8")) {
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+  } else if (filepath.endsWith(".ts")) {
+    res.setHeader("Content-Type", "video/mp2t");
+  } else if (filepath.endsWith(".m4s") || filepath.endsWith(".mp4")) {
+    res.setHeader("Content-Type", "video/mp4");
+  }
+
+  res.sendFile(filepath, (err) => {
+    if (err && !res.headersSent) {
+      res.status(404).json({ ok: false, error: "Fichier introuvable" });
+    }
+  });
+});
 
 // ─── Register / Login ───────────────────────────────────────
 app.post("/register", (req, res) => {
@@ -629,10 +776,20 @@ async function loadAlarmConfig() {
 }
 
 async function saveAlarmConfig(cfg) {
+  // Détection du changement d'état armé
+  const wasArmed = isAlarmArmedCached();
+  const willBeArmed = !!cfg.armed;
+
   await dbQuery(
     "UPDATE alarm_config SET armed=?, armed_zones=?, excluded_do=?, siren_duration=? WHERE id=1",
     [cfg.armed ? 1 : 0, JSON.stringify(cfg.armed_zones), JSON.stringify(cfg.excluded_do), cfg.siren_duration]
   );
+
+  // Met à jour le cache + applique l'état RGPD si l'état armé a changé
+  setAlarmArmedCache(willBeArmed);
+  if (wasArmed !== willBeArmed) {
+    applyRgpdCamsState();
+  }
 }
 
 // Logger un événement DI en base
@@ -751,6 +908,43 @@ async function disarmAlarm() {
   }
 
   console.log("🔓 Alarme désarmée — tous les DO coupés");
+
+  // ─── RGPD : couper les caméras + purger les segments ───
+  setAlarmArmedCache(false);
+  applyRgpdCamsState();
+}
+
+/**
+ * Synchronise l'état des caméras avec l'état de l'alarme selon la config RGPD.
+ * À appeler à chaque arm()/disarm().
+ *
+ * - Si RGPD_CAMS_ONLY_WHEN_ARMED=false : ne fait rien (anciens comportement)
+ * - Si armé : démarre tous les flux HLS
+ * - Si désarmé : tue tous les flux HLS et supprime les segments disque
+ */
+function applyRgpdCamsState() {
+  if (!RGPD_CAMS_ONLY_WHEN_ARMED) return;
+
+  if (isAlarmArmedCached()) {
+    // Démarrer les flux (s'ils ne tournent pas déjà)
+    const anyRunning = Object.values(hlsStreams).some(s => s.process && !s.killed);
+    if (!anyRunning) {
+      console.log("[RGPD] 🎥 Alarme armée → démarrage des flux HLS");
+      startAllHlsStreams();
+    }
+  } else {
+    // Désarmé : kill + purge
+    console.log("[RGPD] 🛡 Alarme désarmée → arrêt FFmpeg + purge segments (art. 5.1.c)");
+    stopAllHlsStreams();
+    // Laisser 1s aux FFmpeg pour libérer les fichiers, puis purger
+    setTimeout(() => {
+      purgeAllHlsSegments();
+      // Reset l'état des streams pour qu'ils redémarrent au prochain arm()
+      for (const key of Object.keys(hlsStreams)) {
+        delete hlsStreams[key];
+      }
+    }, 1500);
+  }
 }
 
 // Polling DI
@@ -814,6 +1008,12 @@ function startPolling() {
 // ─── ROUTES API ─────────────────────────────────────────────
 
 app.get("/api/ping", (req, res) => res.json({ ok: true, msg: "adjudicator up" }));
+
+app.get("/api/features", (req, res) => {
+  res.json({
+    rfidEnabled: process.env.RFID_ENABLED !== "false",
+  });
+});
 
 // ── Config alarme ──
 
@@ -1203,6 +1403,163 @@ app.delete("/api/users/:id", requireAuth, requireAdmin, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// API INTERNE POUR SERVEUR C++ RFID
+// ─────────────────────────────────────────────
+
+// Normalise les UID pour éviter les problèmes de majuscules/minuscules
+function normalizeUid(uid) {
+  return String(uid || "").trim().toUpperCase();
+}
+
+// GET /api/schedule/now
+// Utilisé par le serveur C++ pour savoir si on est actuellement dans une plage horaire
+app.get("/api/schedule/now", async (req, res) => {
+  try {
+    const slots = await loadScheduleSlots();
+    const inSchedule = isInSchedule(slots);
+
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+
+    return res.json({
+      ok: true,
+      in_schedule: inSchedule,
+      current_time: `${hh}:${mm}`,
+      slots
+    });
+  } catch (e) {
+    console.error("[API C++] /api/schedule/now error:", e.message);
+    return res.status(500).json({
+      ok: false,
+      error: e.message
+    });
+  }
+});
+
+// GET /api/rfid/check/:uid
+// Vérifie simplement si un badge existe et est activé
+app.get("/api/rfid/check/:uid", async (req, res) => {
+  try {
+    const uid = normalizeUid(req.params.uid);
+
+    if (!uid) {
+      return res.status(400).json({
+        ok: false,
+        authorized: false,
+        error: "UID manquant"
+      });
+    }
+
+    const rows = await dbQuery(
+      "SELECT * FROM rfid_badges WHERE UPPER(uid) = ? LIMIT 1",
+      [uid]
+    );
+
+    if (rows.length === 0) {
+      console.log(`[RFID C++] Badge inconnu: ${uid}`);
+
+      return res.json({
+        ok: true,
+        authorized: false,
+        uid,
+        message: "Badge inconnu"
+      });
+    }
+
+    const badge = rows[0];
+
+    if (!badge.enabled) {
+      console.log(`[RFID C++] Badge désactivé: ${uid} (${badge.owner})`);
+
+      return res.json({
+        ok: true,
+        authorized: false,
+        uid,
+        owner: badge.owner,
+        message: "Badge désactivé"
+      });
+    }
+
+    console.log(`[RFID C++] Badge autorisé: ${uid} (${badge.owner})`);
+
+    return res.json({
+      ok: true,
+      authorized: true,
+      uid,
+      owner: badge.owner,
+      message: "Badge autorisé"
+    });
+
+  } catch (e) {
+    console.error("[API C++] /api/rfid/check error:", e.message);
+    return res.status(500).json({
+      ok: false,
+      authorized: false,
+      error: e.message
+    });
+  }
+});
+
+// POST /api/rfid/check
+// Variante en POST si ton serveur C++ préfère envoyer du JSON
+app.post("/api/rfid/check", async (req, res) => {
+  try {
+    const uid = normalizeUid(req.body?.uid || req.body?.card_id);
+
+    if (!uid) {
+      return res.status(400).json({
+        ok: false,
+        authorized: false,
+        error: "UID manquant"
+      });
+    }
+
+    const rows = await dbQuery(
+      "SELECT * FROM rfid_badges WHERE UPPER(uid) = ? LIMIT 1",
+      [uid]
+    );
+
+    if (rows.length === 0) {
+      return res.json({
+        ok: true,
+        authorized: false,
+        uid,
+        message: "Badge inconnu"
+      });
+    }
+
+    const badge = rows[0];
+
+    if (!badge.enabled) {
+      return res.json({
+        ok: true,
+        authorized: false,
+        uid,
+        owner: badge.owner,
+        message: "Badge désactivé"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      authorized: true,
+      uid,
+      owner: badge.owner,
+      message: "Badge autorisé"
+    });
+
+  } catch (e) {
+    console.error("[API C++] POST /api/rfid/check error:", e.message);
+    return res.status(500).json({
+      ok: false,
+      authorized: false,
+      error: e.message
+    });
   }
 });
 
@@ -1674,12 +2031,31 @@ app.post("/api/cam/hls/restart", requireAuth, requireAdmin, (req, res) => {
 });
 
 // ─── DÉMARRAGE ──────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`adjudicator.js lancé sur le port ${PORT}`);
   console.log(`PET-DO: ${PET_DO_IP}:${PET_DO_PORT} (unit ${PET_DO_UNIT})`);
   console.log(`PET-DI: ${PET_DI_IP}:${PET_DI_PORT} (unit ${PET_DI_UNIT})`);
   console.log(`Caméras configurées : ${CAMERAS.length} (alarme → ${ALARM_REC_CAM})`);
   CAMERAS.forEach(c => console.log(`  - ${c.id} : ${c.name} (${c.type})`));
+
+  if (RGPD_CAMS_ONLY_WHEN_ARMED) {
+    console.log(`🛡 RGPD : caméras désactivées quand l'alarme est désarmée (conformité art. 5.1.c)`);
+  }
+
+  // RGPD : charger l'état armé depuis la BDD AVANT d'éventuellement démarrer les flux
+  try {
+    const cfg = await loadAlarmConfig();
+    setAlarmArmedCache(cfg.armed);
+    console.log(`État alarme au boot : ${cfg.armed ? "ARMÉE" : "désarmée"}`);
+  } catch (e) {
+    console.error("Erreur lecture état alarme initial:", e.message);
+  }
+
+  // Purger systématiquement les anciens segments au boot pour repartir propre
+  if (RGPD_CAMS_ONLY_WHEN_ARMED) {
+    purgeAllHlsSegments();
+  }
+
   startPolling();
   startAllHlsStreams();
 });
