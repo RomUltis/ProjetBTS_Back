@@ -1,10 +1,20 @@
 {
-  "name": "serverweb",
+  "name": "serveurweb",
   "version": "1.0.0",
-  "description": "Application de Ticket",
-  "main": "index.js",
+  "description": "Serveur web pour l'alarme",
+  "main": "adjudicator.js",
+  "bin": "adjudicator.js",
+  "pkg": {
+    "assets": [
+      "src/**/*",
+      ".env",
+      "node_modules/**/*"
+    ],
+    "targets": ["node18-win-x64"]
+  },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "pkg . --output adjudicator.exe"
   },
   "author": "Baptiste Delabroye, Romain Ultis",
   "license": "ISC",
