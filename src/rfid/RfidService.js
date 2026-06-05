@@ -1,8 +1,20 @@
+/*
+ * RfidService — gestion et vérification des badges.
+ *
+ * Depuis la refonte, le contrôle d'accès RFID (badge → armement/désarmement,
+ * ouverture de la gâche) est géré par l'application C++. Le back ne fait plus
+ * que :
+ *   - vérifier un badge à la demande du C++ (GET/POST /api/rfid/check) ;
+ *   - gérer la liste des badges (CRUD côté dashboard) ;
+ *   - l'enrôlement : capturer l'UID d'un nouveau badge. Comme les scans
+ *     matériels arrivent maintenant au C++, c'est la requête de vérification
+ *     envoyée par le C++ qui sert à capturer l'UID quand le mode est actif.
+ *
+ * Ce service ne touche plus ni à l'alarme ni au Modbus (gâche).
+ */
 class RfidService {
-  constructor({ db, alarm, petDO }) {
+  constructor({ db }) {
     this.db = db;
-    this.alarm = alarm;
-    this.petDO = petDO;
 
     this.enrollMode = {
       active: false,
@@ -16,8 +28,11 @@ class RfidService {
     return String(uid || "").trim().toUpperCase();
   }
 
-  // Vérification d'un badge (appelée par le serveur C++), insensible à la casse
+  // Vérification d'un badge (appelée par l'app C++), insensible à la casse.
+  // Si le mode enrollment est actif, l'UID présenté est capturé au passage.
   async check(uid, { log = false } = {}) {
+    this._captureForEnroll(uid);
+
     const rows = await this.db.query(
       "SELECT * FROM rfid_badges WHERE UPPER(uid) = ? LIMIT 1",
       [uid]
@@ -38,120 +53,16 @@ class RfidService {
     return { ok: true, authorized: true, uid, owner: badge.owner, message: "Badge autorisé" };
   }
 
-  // Scan matériel : bascule l'alarme selon le badge. Recherche par uid exact.
-  async scan({ card_id, raw_hex, wiegand_type }) {
-    console.log(`[RFID] Scan reçu: card_id=${card_id}, raw=${raw_hex}, type=W${wiegand_type}`);
-
-    if (this.enrollMode.active && Date.now() < this.enrollMode.expiresAt) {
-      console.log(`[RFID] Mode enrollment → badge capturé: ${card_id}`);
-      this.enrollMode.detectedUid = card_id;
+  // Capture l'UID si une session d'enrollment est en cours (et non expirée).
+  _captureForEnroll(uid) {
+    if (!this.enrollMode.active) return;
+    if (Date.now() >= this.enrollMode.expiresAt) {
       this.enrollMode.active = false;
-      return { ok: true, enrollment: true, message: "Badge capturé pour enrollment" };
+      return;
     }
-    if (this.enrollMode.active && Date.now() >= this.enrollMode.expiresAt) {
-      this.enrollMode.active = false;
-      this.enrollMode.detectedUid = null;
-    }
-
-    const rows = await this.db.query(
-      "SELECT * FROM rfid_badges WHERE uid = ? LIMIT 1",
-      [card_id]
-    );
-
-    if (rows.length === 0) {
-      console.log(`[RFID] Badge inconnu: ${card_id}`);
-      try {
-        await this.db.query(
-          "INSERT INTO di_events (channel, zone, label, old_val, new_val, triggered) VALUES (?, ?, ?, ?, ?, ?)",
-          [-1, "rfid", `Badge inconnu: ${card_id}`, 0, 1, 0]
-        );
-      } catch (e) { }
-      return { ok: true, authorized: false, message: "Badge inconnu" };
-    }
-
-    const badge = rows[0];
-    if (!badge.enabled) {
-      console.log(`[RFID] Badge désactivé: ${card_id} (${badge.owner})`);
-      return { ok: true, authorized: false, message: "Badge désactivé" };
-    }
-
-    console.log(`[RFID] ✓ Accès autorisé: ${badge.owner} (${card_id})`);
-
-    const config = await this.alarm.loadConfig();
-    let newArmedState;
-    let alarmAction;
-
-    if (config.armed) {
-      config.armed = false;
-      this.alarm.armedBySchedule = false;
-      await this.alarm.saveConfig(config);
-      if (this.alarm.triggered) {
-        await this.alarm.disarm();
-      } else {
-        this.alarm.triggered = false;
-        this.alarm.triggerInfo = null;
-        // Pas d'alarme en cours : ouvrir la gâche soi-même (disarm() ne sera pas appelé)
-        try { await this.petDO.pulseCoil(0, 3000); } catch {}
-        console.log("[RFID] 🔓 Gâche ouverte (désarmement par badge)");
-      }
-      newArmedState = false;
-      alarmAction = "disarmed";
-      console.log(`[RFID] 🔓 Alarme DÉSARMÉE par ${badge.owner}`);
-
-      if (this.alarm.beepEnabled) {
-        await this.alarm.beepDisarm();
-        console.log(`[RFID] 🔔 Bip désarmement`);
-      }
-    } else {
-      const openDoors = this.alarm.findOpenDoors(config.armed_zones);
-      if (openDoors.length > 0) {
-        const names = openDoors.map((d) => d.label).join(", ");
-        console.log(`[RFID] ⚠ Armement impossible — portes ouvertes: ${names}`);
-
-        try {
-          await this.db.query(
-            "INSERT INTO di_events (channel, zone, label, old_val, new_val, triggered) VALUES (?, ?, ?, ?, ?, ?)",
-            [-1, "rfid", `Armement refusé (portes ouvertes): ${badge.owner}`, 0, 1, 0]
-          );
-        } catch (e) { }
-
-        return {
-          ok: true,
-          authorized: true,
-          owner: badge.owner,
-          alarm_action: "arm_failed",
-          message: `Armement impossible — portes ouvertes: ${names}`,
-        };
-      }
-
-      config.armed = true;
-      this.alarm.armedBySchedule = false;
-      await this.alarm.saveConfig(config);
-      newArmedState = true;
-      alarmAction = "armed";
-      console.log(`[RFID] 🔒 Alarme ARMÉE par ${badge.owner}`);
-
-      if (this.alarm.beepEnabled) {
-        await this.alarm.beepArm();
-        console.log(`[RFID] 🔔🔔 Double bip armement`);
-      }
-    }
-
-    try {
-      await this.db.query(
-        "INSERT INTO di_events (channel, zone, label, old_val, new_val, triggered) VALUES (?, ?, ?, ?, ?, ?)",
-        [-1, "rfid", `${alarmAction === "armed" ? "Armement" : "Désarmement"} par ${badge.owner} (${card_id})`, 0, 1, 0]
-      );
-    } catch (e) { }
-
-    return {
-      ok: true,
-      authorized: true,
-      owner: badge.owner,
-      alarm_action: alarmAction,
-      armed: newArmedState,
-      message: alarmAction === "armed" ? "Alarme armée" : "Alarme désarmée",
-    };
+    console.log(`[RFID] Mode enrollment → badge capturé: ${uid}`);
+    this.enrollMode.detectedUid = uid;
+    this.enrollMode.active = false;
   }
 
   enrollStart() {

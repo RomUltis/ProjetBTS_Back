@@ -35,42 +35,41 @@ class ScheduleService {
     }
   }
 
-  // Arme/désarme automatiquement selon l'heure courante
+  // Arme/désarme automatiquement selon l'heure courante.
+  // L'armement réel est délégué à l'app C++ (via alarm.arm()/disarm()).
   async checkSchedule() {
     try {
       const slots = await this.loadSlots();
       const inSchedule = this.isInSchedule(slots);
-      const config = await this.alarm.loadConfig();
+      const armed = this.alarm.isArmed();
 
       const now = new Date();
       const hh = String(now.getHours()).padStart(2, "0");
       const mm = String(now.getMinutes()).padStart(2, "0");
 
-      console.log(`⏰ Schedule check: ${hh}:${mm} | ${slots.length} plage(s) | inSchedule=${inSchedule} | armed=${config.armed} | armedBySchedule=${this.alarm.armedBySchedule}`);
+      console.log(`⏰ Schedule check: ${hh}:${mm} | ${slots.length} plage(s) | inSchedule=${inSchedule} | armed=${armed} | armedBySchedule=${this.alarm.armedBySchedule}`);
 
-      if (inSchedule && !config.armed) {
-        const openDoors = this.alarm.findOpenDoors(config.armed_zones);
+      if (inSchedule && !armed) {
+        const openDoors = this.alarm.openDoors();
         if (openDoors.length > 0) {
           console.log(`⏰ Schedule: dans la plage mais porte(s) ouverte(s) → armement impossible (${openDoors.map((d) => d.label).join(", ")})`);
           return;
         }
 
-        config.armed = true;
-        await this.alarm.saveConfig(config);
+        await this.alarm.arm();
         this.alarm.armedBySchedule = true;
-        console.log(`⏰ Schedule: ARMEMENT AUTOMATIQUE effectué`);
+        console.log(`⏰ Schedule: ARMEMENT AUTOMATIQUE relayé au C++`);
 
-      } else if (!inSchedule && config.armed && this.alarm.armedBySchedule) {
+      } else if (!inSchedule && armed && this.alarm.armedBySchedule) {
         // Ne pas désarmer si une alarme est en cours
         if (this.alarm.triggered) {
           console.log(`⏰ Schedule: fin de plage mais alarme en cours → on ne désarme PAS`);
           return;
         }
 
-        config.armed = false;
-        await this.alarm.saveConfig(config);
+        await this.alarm.disarm();
         this.alarm.armedBySchedule = false;
-        console.log(`⏰ Schedule: DÉSARMEMENT AUTOMATIQUE (fin de plage, aucune détection)`);
+        console.log(`⏰ Schedule: DÉSARMEMENT AUTOMATIQUE relayé au C++ (fin de plage, aucune détection)`);
       }
     } catch (e) {
       console.error("checkSchedule error:", e.message);

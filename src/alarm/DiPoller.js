@@ -1,12 +1,18 @@
 const { DI_MAP } = require("../config/maps");
 
+/*
+ * DiPoller — lecture des entrées (PET-7050) POUR AFFICHAGE UNIQUEMENT.
+ *
+ * Depuis la refonte, la détection d'intrusion et le déclenchement de l'alarme
+ * sont gérés par l'application C++. Ce poller ne décide donc plus rien : il se
+ * contente de rafraîchir l'état des capteurs pour le dashboard (panneau DI) et
+ * pour le pré-contrôle « portes ouvertes » avant un armement.
+ */
 class DiPoller {
-  constructor({ petDI, alarm, config }) {
+  constructor({ petDI, config }) {
     this.petDI = petDI;
-    this.alarm = alarm;
     this.pollMs = config.diPollMs;
 
-    this.lastDIState = {};
     this.currentDIState = {};
     this._interval = null;
   }
@@ -17,32 +23,11 @@ class DiPoller {
 
   async pollDI() {
     try {
-      await this.alarm.checkSirenTimeout();
-
       const bits = await this.petDI.readDiscreteInputs(0, 18);
-      const config = await this.alarm.loadConfig();
-
       for (const di of DI_MAP) {
         const rawVal = !!bits[di.ch];
-        // Contacts NF inversés : triggered = état "en alerte" (porte ouverte / mouvement)
-        const triggered = di.inverted ? !rawVal : rawVal;
-        const prev = this.lastDIState[di.ch];
-        this.currentDIState[di.ch] = triggered;
-
-        if (prev !== undefined && prev !== triggered) {
-          console.log(`DI${di.ch} changé: ${prev} → ${triggered} (${di.label})`);
-          const willTrigger = config.armed && triggered && !this.alarm.triggered;
-
-          if (config.armed) {
-            await this.alarm.logDIEvent(di.ch, triggered, willTrigger);
-          }
-
-          if (willTrigger) {
-            await this.alarm.triggerAlarm(di.ch, config);
-          }
-        }
-
-        this.lastDIState[di.ch] = triggered;
+        // Contacts NF inversés : true = état "en alerte" (porte ouverte / mouvement)
+        this.currentDIState[di.ch] = di.inverted ? !rawVal : rawVal;
       }
     } catch (e) {
       console.error("pollDI error:", e?.message || e);
@@ -54,7 +39,7 @@ class DiPoller {
 
   start() {
     if (this._interval) return;
-    console.log(`Polling DI démarré (${this.pollMs}ms)`);
+    console.log(`Lecture DI (affichage) démarrée (${this.pollMs}ms)`);
     this._interval = setInterval(() => this.pollDI(), this.pollMs);
     this.pollDI();
   }

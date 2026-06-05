@@ -30,6 +30,16 @@ class Config {
     };
     this.diPollMs = Number(env.DI_POLL_MS || 1000);
 
+    // Application C++ (AlarmCore / SurveillanceHttpApi) qui gère désormais
+    // toute la surveillance et l'alarme. Le back ne fait que lui relayer
+    // l'armement/désarmement et recevoir ses ordres d'enregistrement.
+    this.surveillance = {
+      baseUrl: (env.CPP_SURVEILLANCE_URL || "http://127.0.0.1:8080").replace(/\/+$/, ""),
+      token: env.SURVEILLANCE_TOKEN || "",
+      pollMs: Number(env.SURVEILLANCE_POLL_MS || 2000),
+      timeoutMs: Number(env.SURVEILLANCE_TIMEOUT_MS || 3000),
+    };
+
     this.PULSE_MS_DEFAULT = 1000;
     this.PULSE_MS_MIN = 100;
     this.PULSE_MS_MAX = 3000;

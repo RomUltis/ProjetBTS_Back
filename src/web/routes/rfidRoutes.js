@@ -75,20 +75,9 @@ module.exports = function rfidRoutes({ rfid, requireAuth, requireAdmin }) {
     }
   });
 
-  // Scan matériel (bascule l'alarme)
-  router.post("/rfid/scan", async (req, res) => {
-    try {
-      const { card_id } = req.body || {};
-      if (!card_id) {
-        return res.status(400).json({ ok: false, error: "card_id manquant" });
-      }
-      const result = await rfid.scan(req.body || {});
-      return res.json(result);
-    } catch (e) {
-      console.error("[RFID] Erreur scan:", e.message);
-      return res.status(500).json({ ok: false, error: e.message });
-    }
-  });
+  // NB : le scan matériel n'est plus reçu ici. L'app C++ reçoit les badges de
+  // l'Arduino et interroge /api/rfid/check ci-dessus ; c'est elle qui pilote
+  // l'armement/désarmement et la gâche.
 
   // Enrollment (détection automatique d'un badge)
   router.post("/rfid/enroll/start", requireAuth, requireAdmin, (req, res) => {

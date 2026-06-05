@@ -7,6 +7,7 @@ const AuthService = require("../auth/AuthService");
 const { makeAuthMiddleware } = require("../auth/authMiddleware");
 const ModbusDevice = require("../hardware/ModbusDevice");
 const CameraRegistry = require("../camera/CameraRegistry");
+const SurveillanceClient = require("../surveillance/SurveillanceClient");
 const AlarmService = require("../alarm/AlarmService");
 const HlsManager = require("../camera/HlsManager");
 const RecordingManager = require("../camera/RecordingManager");
@@ -17,6 +18,7 @@ const RfidService = require("../rfid/RfidService");
 const featureRoutes = require("./routes/featureRoutes");
 const authRoutes = require("./routes/authRoutes");
 const alarmRoutes = require("./routes/alarmRoutes");
+const surveillanceRoutes = require("./routes/surveillanceRoutes");
 const diRoutes = require("./routes/diRoutes");
 const doRoutes = require("./routes/doRoutes");
 const scheduleRoutes = require("./routes/scheduleRoutes");
@@ -32,23 +34,46 @@ class App {
     this.auth = new AuthService(this.config);
     this.mw = makeAuthMiddleware(this.auth);
 
+    // PET-DO conservé uniquement pour les tests unitaires de relais (dashboard).
+    // PET-DI conservé en lecture seule pour l'affichage des capteurs.
     this.petDO = new ModbusDevice({ ...this.config.petDO, name: "PET-DO" });
     this.petDI = new ModbusDevice({ ...this.config.petDI, name: "PET-DI" });
     this.cameras = new CameraRegistry(this.config);
 
-    this.alarm = new AlarmService({ db: this.db, petDO: this.petDO, config: this.config });
+    // Pont vers l'app C++ qui gère désormais toute l'alarme/surveillance.
+    this.surveillance = new SurveillanceClient({ config: this.config });
+    this.alarm = new AlarmService({ db: this.db, surveillance: this.surveillance, config: this.config, petDO: this.petDO });
 
     // Caméras : HLS réagit à 'armedChange' (RGPD) + enregistrement
     this.hls = new HlsManager({ config: this.config, cameras: this.cameras, getArmed: () => this.alarm.isArmed() });
     this.recordings = new RecordingManager({ config: this.config, cameras: this.cameras });
-    this.alarm.setRecordingManager(this.recordings);
-    this.alarm.on("armedChange", (armed) => this.hls.applyRgpdState(armed));
 
-    this.diPoller = new DiPoller({ petDI: this.petDI, alarm: this.alarm, config: this.config });
+    // RGPD + arrêt de l'enregistrement alarme au désarmement
+    this.alarm.on("armedChange", (armed) => {
+      this.hls.applyRgpdState(armed);
+      if (!armed) {
+        const cur = this.recordings.get(this.cameras.alarmRecCam);
+        if (cur && cur.autoAlarm) {
+          this.recordings.stop(this.cameras.alarmRecCam);
+          console.log("🔓 Désarmement → enregistrement alarme arrêté");
+        }
+      }
+    });
+
+    // Filet de sécurité : si le C++ signale une alarme via le polling de statut
+    // (au cas où le webhook /api/surveillance/event n'aurait pas abouti).
+    this.surveillance.on("alarmActiveChange", (active) => {
+      if (active) {
+        const r = this.recordings.start("alarm", this.cameras.alarmRecCam);
+        if (r.ok) console.log("🚨 Alarme C++ détectée (polling statut) → enregistrement démarré");
+      }
+    });
+
+    this.diPoller = new DiPoller({ petDI: this.petDI, config: this.config });
     this.alarm.setDiStateProvider(() => this.diPoller.current);
     this.schedule = new ScheduleService({ db: this.db, alarm: this.alarm });
 
-    this.rfid = new RfidService({ db: this.db, alarm: this.alarm, petDO: this.petDO });
+    this.rfid = new RfidService({ db: this.db });
 
     this.app = express();
     this._setupMiddleware();
@@ -68,6 +93,7 @@ class App {
     this.app.use(featureRoutes({ config: this.config }));
     this.app.use(authRoutes({ db: this.db, authService: this.auth }));
     this.app.use(alarmRoutes({ alarm: this.alarm, requireAuth, requireAdmin }));
+    this.app.use(surveillanceRoutes({ recordings: this.recordings, cameras: this.cameras, config: this.config }));
     this.app.use(diRoutes({ diPoller: this.diPoller, alarm: this.alarm, db: this.db, requireAuth }));
     this.app.use(doRoutes({ petDO: this.petDO, config: this.config, requireAuth, requireAdmin }));
     this.app.use(scheduleRoutes({ scheduleService: this.schedule, db: this.db, requireAuth, requireAdmin }));
@@ -83,6 +109,7 @@ class App {
   _setupShutdown() {
     const gracefulShutdown = (signal) => {
       console.log(`\n[HLS] Signal ${signal} reçu, arrêt des flux FFmpeg…`);
+      this.surveillance.stopPolling();
       this.hls.stopAll();
       setTimeout(() => process.exit(0), 1000);
     };
@@ -95,8 +122,9 @@ class App {
 
     this.app.listen(this.config.PORT, async () => {
       console.log(`adjudicator.js lancé sur le port ${this.config.PORT}`);
-      console.log(`PET-DO: ${this.config.petDO.ip}:${this.config.petDO.port} (unit ${this.config.petDO.unit})`);
-      console.log(`PET-DI: ${this.config.petDI.ip}:${this.config.petDI.port} (unit ${this.config.petDI.unit})`);
+      console.log(`Centrale C++ (surveillance/alarme) : ${this.config.surveillance.baseUrl}`);
+      console.log(`PET-DO (tests relais) : ${this.config.petDO.ip}:${this.config.petDO.port} (unit ${this.config.petDO.unit})`);
+      console.log(`PET-DI (affichage)    : ${this.config.petDI.ip}:${this.config.petDI.port} (unit ${this.config.petDI.unit})`);
       console.log(`Caméras configurées : ${this.cameras.length} (alarme → ${this.cameras.alarmRecCam})`);
       this.cameras.cameras.forEach((c) => console.log(`  - ${c.id} : ${c.name} (${c.type})`));
 
@@ -104,19 +132,19 @@ class App {
         console.log(`🛡 RGPD : caméras désactivées quand l'alarme est désarmée (conformité art. 5.1.c)`);
       }
 
-      // Charger l'état armé depuis la BDD avant de démarrer les flux (RGPD)
+      // Lit l'état réel auprès du C++ avant de décider du démarrage des flux (RGPD)
       try {
-        const cfg = await this.alarm.loadConfig();
-        this.alarm.initArmedCache(cfg.armed);
-        console.log(`État alarme au boot : ${cfg.armed ? "ARMÉE" : "désarmée"}`);
+        await this.surveillance.fetchStatus();
+        console.log(`État alarme au boot (C++) : ${this.alarm.isArmed() ? "ARMÉE" : "désarmée"}`);
       } catch (e) {
-        console.error("Erreur lecture état alarme initial:", e.message);
+        console.error("Centrale C++ injoignable au boot :", e.message);
       }
 
       if (this.config.rgpdCamsOnlyWhenArmed) {
         this.hls.purgeSegments();
       }
 
+      this.surveillance.startPolling();
       this.diPoller.start();
       this.schedule.start();
       this.hls.startAll();
