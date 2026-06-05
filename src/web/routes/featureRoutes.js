@@ -6,7 +6,10 @@ module.exports = function featureRoutes({ config }) {
   router.get("/api/ping", (req, res) => res.json({ ok: true, msg: "adjudicator up" }));
 
   router.get("/api/features", (req, res) => {
-    res.json({ rfidEnabled: config.rfidEnabled });
+    res.json({
+      rfidEnabled: config.rfidEnabled,
+      armConfigEnabled: config.armConfigEnabled,
+    });
   });
 
   return router;

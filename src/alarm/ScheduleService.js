@@ -28,7 +28,11 @@ class ScheduleService {
 
   async loadSlots() {
     try {
-      return await this.db.query("SELECT `id`, `start`, `end` FROM `schedule_slots` ORDER BY `id`");
+      const rows = await this.db.query("SELECT `id`, `start`, `end` FROM `schedule_slots` ORDER BY `id`");
+      // Ignore les plages incomplètes (start/end vide ou NULL) : elles restaient
+      // "bloquées" dans la liste et empêchaient l'armement horaire (sautées par
+      // isInSchedule). Le prochain enregistrement les purge définitivement.
+      return rows.filter((s) => s.start && s.end);
     } catch (e) {
       console.error("loadScheduleSlots error:", e.message);
       return [];

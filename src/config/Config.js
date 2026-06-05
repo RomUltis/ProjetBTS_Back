@@ -7,6 +7,8 @@ class Config {
     this.JWT_SECRET = env.JWT_SECRET;
 
     this.rfidEnabled = env.RFID_ENABLED !== "false";
+    // Masque la section "Configuration d'armement" du dashboard si "false"
+    this.armConfigEnabled = env.ARM_CONFIG_ENABLED !== "false";
 
     this.db = {
       host: env.DB_HOST,
