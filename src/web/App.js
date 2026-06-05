@@ -48,24 +48,22 @@ class App {
     this.hls = new HlsManager({ config: this.config, cameras: this.cameras, getArmed: () => this.alarm.isArmed() });
     this.recordings = new RecordingManager({ config: this.config, cameras: this.cameras });
 
-    // RGPD + arrêt de l'enregistrement alarme au désarmement
+    // RGPD + arrêt de l'enregistrement de TOUTES les caméras au désarmement
     this.alarm.on("armedChange", (armed) => {
       this.hls.applyRgpdState(armed);
       if (!armed) {
-        const cur = this.recordings.get(this.cameras.alarmRecCam);
-        if (cur && cur.autoAlarm) {
-          this.recordings.stop(this.cameras.alarmRecCam);
-          console.log("🔓 Désarmement → enregistrement alarme arrêté");
-        }
+        const stopped = this.recordings.stopAll({ onlyAuto: true });
+        if (stopped.length) console.log(`🔓 Désarmement → ${stopped.length} enregistrement(s) alarme arrêté(s)`);
       }
     });
 
-    // Filet de sécurité : si le C++ signale une alarme via le polling de statut
-    // (au cas où le webhook /api/surveillance/event n'aurait pas abouti).
+    // Intrusion signalée par le C++ (polling statut) → enregistre TOUTES les
+    // caméras (chacune dans son dossier) jusqu'au désarmement manuel.
     this.surveillance.on("alarmActiveChange", (active) => {
       if (active) {
-        const r = this.recordings.start("alarm", this.cameras.alarmRecCam);
-        if (r.ok) console.log("🚨 Alarme C++ détectée (polling statut) → enregistrement démarré");
+        const res = this.recordings.startAll("alarm");
+        const ok = res.filter((r) => r.ok).length;
+        console.log(`🚨 Intrusion C++ détectée → enregistrement démarré sur ${ok}/${res.length} caméra(s)`);
       }
     });
 

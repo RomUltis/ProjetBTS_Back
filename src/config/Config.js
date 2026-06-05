@@ -80,6 +80,9 @@ class Config {
         hls_main: `/cam/cam${i}/main/live.m3u8`,
         hls_sub: `/cam/cam${i}/sub/live.m3u8`,
         hlsMode: (env[`CAM${i}_HLS_MODE`] || "copy").toLowerCase(),
+        // Sous-dossier d'enregistrement (sous RECORDINGS_PATH). À régler sur le
+        // nom du dossier SFTP de la cam (camciel1, camciel1bis, camciel2, …).
+        recFolder: env[`CAM${i}_REC_FOLDER`] || `cam${i}`,
       });
     }
     // Ancien setup : une seule cam via RTSP_URL
@@ -89,6 +92,7 @@ class Config {
         rtsp_main: this.RTSP_URL, rtsp_sub: "",
         hls_main: "/cam/main/live.m3u8", hls_sub: "/cam/sub/live.m3u8",
         hlsMode: (env.CAM1_HLS_MODE || "copy").toLowerCase(),
+        recFolder: env.CAM1_REC_FOLDER || "cam1",
       });
     }
     return cams;

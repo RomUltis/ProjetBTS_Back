@@ -28,27 +28,23 @@ module.exports = function surveillanceRoutes({ recordings, cameras, config }) {
     if (!tokenOk(req, res)) return;
 
     const { event, source } = req.body || {};
-    const camId = cameras.alarmRecCam;
 
     switch (event) {
       case "intrusion":
       case "alarm_started":
       case "record_start": {
-        const r = recordings.start("alarm", camId);
-        console.log(`[C++→REC] ${event}${source ? " (" + source + ")" : ""} → enregistrement ${r.ok ? "démarré" : "(" + r.reason + ")"}`);
-        return res.json({ ok: true, recording: r });
+        const res2 = recordings.startAll("alarm");
+        const ok = res2.filter((r) => r.ok).length;
+        console.log(`[C++→REC] ${event}${source ? " (" + source + ")" : ""} → enregistrement sur ${ok}/${res2.length} caméra(s)`);
+        return res.json({ ok: true, recordings: res2 });
       }
 
       case "disarmed":
       case "alarm_cleared":
       case "record_stop": {
-        const cur = recordings.get(camId);
-        if (cur && cur.autoAlarm) {
-          const r = recordings.stop(camId);
-          console.log(`[C++→REC] ${event} → enregistrement arrêté`);
-          return res.json({ ok: true, recording: r });
-        }
-        return res.json({ ok: true, recording: { ok: false, reason: "not_auto_recording" } });
+        const stopped = recordings.stopAll({ onlyAuto: true });
+        console.log(`[C++→REC] ${event} → ${stopped.length} enregistrement(s) arrêté(s)`);
+        return res.json({ ok: true, stopped });
       }
 
       default:
