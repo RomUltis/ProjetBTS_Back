@@ -26,6 +26,12 @@ module.exports = function camRoutes({ cameras, hls, recordings, alarm, config, r
       return res.status(400).json({ ok: false, error: "Chemin invalide" });
     }
 
+    // Démarre le flux À LA DEMANDE (camId/quality/...) : le bouton main/sub du
+    // front fonctionne sans pré-lancer tous les flux, et chaque accès évite que
+    // le reaper coupe un flux qu'on est en train de regarder.
+    const parts = relativePath.split("/");
+    if (parts.length >= 2) hls.ensureStream(parts[0], parts[1]);
+
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     res.setHeader("Pragma", "no-cache");
 
