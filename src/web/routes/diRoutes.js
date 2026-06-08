@@ -64,5 +64,31 @@ module.exports = function diRoutes({ diPoller, alarm, db, requireAuth }) {
     res.json({ ok: true, inputs: DI_MAP, outputs: DO_MAP, zones: ZONES });
   });
 
+  // Réception d'un événement capteur depuis l'application C++ (E2)
+  // Appelé uniquement quand le système est ARMÉ côté C++.
+  // Pas d'auth JWT : appelé machine-to-machine en réseau local (même pattern que /api/surveillance/event).
+  router.post("/api/di/event", async (req, res) => {
+    try {
+      const { channel, zone, label, value, triggered } = req.body;
+      if (channel === undefined || channel === null) {
+        return res.status(400).json({ ok: false, error: "channel manquant" });
+      }
+      await db.query(
+        "INSERT INTO di_events (channel, zone, label, value, triggered) VALUES (?, ?, ?, ?, ?)",
+        [
+          Number(channel),
+          zone   || null,
+          label  || null,
+          value     ? 1 : 0,
+          triggered ? 1 : 0,
+        ]
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("POST /api/di/event error:", e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
   return router;
 };
