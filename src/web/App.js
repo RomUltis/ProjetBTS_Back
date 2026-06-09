@@ -57,17 +57,30 @@ class App {
       }
     });
 
-    // Intrusion signalée par le C++ (polling statut) → enregistre TOUTES les
-    // caméras (chacune dans son dossier) jusqu'au désarmement manuel.
+    // Filet de sécurité : si le C++ remonte alarm_active (s'il surveille de
+    // vraies entrées), on (re)lance aussi l'enregistrement. Idempotent.
     this.surveillance.on("alarmActiveChange", (active) => {
       if (active) {
         const res = this.recordings.startAll("alarm");
         const ok = res.filter((r) => r.ok).length;
-        console.log(`🚨 Intrusion C++ détectée → enregistrement démarré sur ${ok}/${res.length} caméra(s)`);
+        console.log(`🚨 Alarme C++ (alarm_active) → enregistrement ${ok}/${res.length} caméra(s)`);
       }
     });
 
-    this.diPoller = new DiPoller({ petDI: this.petDI, config: this.config });
+    // Détection d'intrusion côté back, sur les 6 VRAIS capteurs : quand c'est
+    // armé et qu'un capteur passe en alerte → enregistrement de toutes les
+    // caméras (jusqu'au désarmement) + journalisation dans di_events.
+    this.diPoller = new DiPoller({
+      petDI: this.petDI,
+      config: this.config,
+      getArmed: () => this.alarm.isArmed(),
+      onIntrusion: (di) => {
+        const res = this.recordings.startAll("alarm");
+        const ok = res.filter((r) => r.ok).length;
+        console.log(`🚨 Intrusion détectée (DI${di.ch} — ${di.label}) → enregistrement ${ok}/${res.length} caméra(s)`);
+        this.alarm.logIntrusion(di);
+      },
+    });
     this.alarm.setDiStateProvider(() => this.diPoller.current);
     this.schedule = new ScheduleService({ db: this.db, alarm: this.alarm });
 

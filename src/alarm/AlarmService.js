@@ -99,6 +99,23 @@ class AlarmService extends EventEmitter {
     return DI_MAP.filter((di) => di.type === "porte" && !!diState[di.ch]);
   }
 
+  // ---- Journal des intrusions (di_events) ----
+  // Appelé par le DiPoller quand un capteur passe en alerte alors que le système
+  // est armé. On journalise CE capteur (canal + zone + label, triggered=1).
+  // → réalimente le journal d'événements du site, UNIQUEMENT sur intrusion.
+  async logIntrusion(di) {
+    if (!di) return;
+    try {
+      await this.db.query(
+        "INSERT INTO di_events (channel, zone, label, value, triggered) VALUES (?, ?, ?, ?, ?)",
+        [di.ch, di.zone, di.label, 1, 1]
+      );
+      console.log(`🚨 Intrusion journalisée : DI${di.ch} — ${di.label}`);
+    } catch (e) {
+      console.error("logIntrusion error:", e.message);
+    }
+  }
+
   // ---- Bips sonores (retour utilisateur) ----
   // Le back pilote brièvement la/les sirène(s) via petDO pour signaler
   // l'armement (double bip) et le désarmement (simple bip). Chaque bip est
